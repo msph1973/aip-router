@@ -25,6 +25,7 @@ export function injectPonytail(body) {
   if (sysIdx >= 0) {
     const msg = body.messages[sysIdx];
     if (typeof msg.content === "string") msg.content += prompt;
+    else if (Array.isArray(msg.content)) msg.content.push({ type: "text", text: PONYTAIL_PROMPT });
     else msg.content = PONYTAIL_PROMPT;
   } else {
     body.messages.unshift({ role: "system", content: PONYTAIL_PROMPT });

@@ -5,7 +5,7 @@ export function dedupLog(input) {
   if (lines.length < 5) return input;
   const out = [];
   let prev = null;
-  let dupCount = 0;
+  let runCount = 0;
   let blankCount = 0;
   for (const line of lines) {
     if (line.trim() === "") {
@@ -13,15 +13,15 @@ export function dedupLog(input) {
       if (blankCount > 1) continue;
     } else blankCount = 0;
     if (line === prev) {
-      dupCount++;
+      runCount++;
       continue;
     }
-    if (dupCount > 1) out.push(`  ... (${dupCount} duplicate lines)`);
-    dupCount = 1;
+    if (runCount > 1) out.push(`  ... (${runCount} duplicate lines)`);
+    runCount = 1;
     out.push(line);
     prev = line;
   }
-  if (dupCount > 1) out.push(`  ... (${dupCount} duplicate lines)`);
+  if (runCount > 1) out.push(`  ... (${runCount} duplicate lines)`);
   if (out.length > DEDUP_LINE_MAX) {
     const head = out.slice(0, 100);
     const tail = out.slice(out.length - 50);

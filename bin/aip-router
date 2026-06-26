@@ -12,14 +12,15 @@ const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const LOG_PATH = join(CONFIG_DIR, "server.log");
 
 let server = null;
-let state = "menu"; // menu | ask_token | ask_port | ask_caveman | ask_headroom
+let state = "menu"; // menu | ask_token_name | ask_token | ask_port | ask_caveman | ask_headroom
+let pendingTokenName = "";
 let config = loadConfig();
 
 function loadConfig() {
   if (existsSync(CONFIG_PATH)) {
     try { return JSON.parse(readFileSync(CONFIG_PATH, "utf8")); } catch {}
   }
-  return { aipToken: "", port: 20129, rtkEnabled: true, cavemanEnabled: false,
+  return { tokens: [], port: 20129, rtkEnabled: true, cavemanEnabled: false,
     cavemanLevel: "full", ponytailEnabled: false, headroomEnabled: false, headroomThreshold: 80 };
 }
 
@@ -37,7 +38,10 @@ function showMenu() {
   clear();
   console.log(`  ${bold("AIP Router")}  ${dim("v1.0 — Interactive CLI")}`);
   console.log(`  ${dim("─".repeat(40))}`);
-  console.log(`  Port:   ${cyan(String(config.port))}    Token: ${config.aipToken ? green("✓") : red("✗")}`);
+  for (const t of config.tokens || []) {
+    console.log(`  Token:  ${bold(t.name)}  ${t.token ? green("✓") : red("✗")}`);
+  }
+  console.log(`  Port:   ${cyan(String(config.port))}`);
   console.log(`  Server: ${server ? green("RUNNING") : dim("stopped")}`);
   console.log(`  ${dim("─".repeat(40))}`);
   console.log(`    ${config.rtkEnabled ? green("●") : dim("○")} 1  RTK Token Saver     ${onOff(config.rtkEnabled)}`);
@@ -45,7 +49,7 @@ function showMenu() {
   console.log(`    ${config.ponytailEnabled ? green("●") : dim("○")} 3  Ponytail Mode      ${onOff(config.ponytailEnabled)}`);
   console.log(`    ${config.headroomEnabled ? green("●") : dim("○")} 4  Headroom Token     ${onOff(config.headroomEnabled)}`);
   console.log(`  ${dim("─".repeat(40))}`);
-  console.log(`    ${dim("t")}  Set token    ${dim("p")}  Set port`);
+  console.log(`    ${dim("t")}  Add token   ${dim("p")}  Set port`);
   console.log(`    ${dim("s")}  Start        ${dim("x")}  Stop`);
   console.log(`    ${dim("l")}  Logs         ${dim("q")}  Quit`);
   console.log(`  ${dim("─".repeat(40))}`);
@@ -57,8 +61,19 @@ rl.on("line", line => {
   const v = line.trim();
 
   switch (state) {
+    case "ask_token_name":
+      if (v) { pendingTokenName = v.trim(); state = "ask_token"; console.log(`  ${dim("Paste token for " + pendingTokenName + " (perm-...):")}`); }
+      else { state = "menu"; showMenu(); }
+      break;
+
     case "ask_token":
-      if (v) { config.aipToken = v; saveConfig(); console.log(green("  Token saved")); }
+      if (v && pendingTokenName) {
+        const existing = config.tokens.findIndex(t => t.name === pendingTokenName);
+        if (existing >= 0) config.tokens[existing].token = v;
+        else config.tokens.push({ name: pendingTokenName, token: v });
+        saveConfig(); console.log(green(`  Token "${pendingTokenName}" saved`));
+      }
+      pendingTokenName = "";
       state = "menu"; showMenu(); break;
 
     case "ask_port":
@@ -81,7 +96,7 @@ rl.on("line", line => {
         case "2": config.cavemanEnabled = !config.cavemanEnabled; saveConfig(); showMenu(); break;
         case "3": config.ponytailEnabled = !config.ponytailEnabled; saveConfig(); showMenu(); break;
         case "4": config.headroomEnabled = !config.headroomEnabled; saveConfig(); showMenu(); break;
-        case "t": state = "ask_token"; console.log(`  ${dim("Paste AIP token (perm-...):")}`); break;
+        case "t": state = "ask_token_name"; console.log(`  ${dim("Token name (e.g. aip, junp):")}`); break;
         case "p": state = "ask_port"; console.log(`  ${dim("Port number:")}`); break;
         case "c": state = "ask_caveman"; console.log(`  ${dim("Level (lite/full/ultra):")}`); break;
         case "h": state = "ask_headroom"; console.log(`  ${dim("Threshold % (0-100):")}`); break;
@@ -94,10 +109,11 @@ rl.on("line", line => {
 });
 
 function startServer() {
-  if (!config.aipToken) { console.log(red("  Set token first (press t)")); return; }
+  if (!config.tokens || !config.tokens.some(t => t.token)) { console.log(red("  Set at least one token (press t)")); return; }
   if (server) { console.log(yellow("  Already running")); return; }
 
-  const env = { AIP_TOKEN: config.aipToken, PORT: String(config.port),
+  const tokenStr = (config.tokens || []).map(t => `${t.name}:${t.token}`).join(",");
+  const env = { AIP_TOKENS: tokenStr, PORT: String(config.port),
     RTK_ENABLED: String(config.rtkEnabled), CAVEMAN_ENABLED: String(config.cavemanEnabled),
     CAVEMAN_LEVEL: config.cavemanLevel, PONYTAIL_ENABLED: String(config.ponytailEnabled),
     HEADROOM_ENABLED: String(config.headroomEnabled), HEADROOM_THRESHOLD: String(config.headroomThreshold) };

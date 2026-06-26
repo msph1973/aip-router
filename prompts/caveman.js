@@ -29,6 +29,7 @@ export function injectCaveman(body, level) {
   if (sysIdx >= 0) {
     const msg = body.messages[sysIdx];
     if (typeof msg.content === "string") msg.content += "\n\n" + prompt;
+    else if (Array.isArray(msg.content)) msg.content.push({ type: "text", text: prompt });
     else msg.content = prompt;
   } else {
     body.messages.unshift({ role: "system", content: prompt });

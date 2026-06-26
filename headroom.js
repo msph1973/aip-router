@@ -1,5 +1,5 @@
 export function estimateContextUsage(body) {
-  if (!body || !body.messages) return { total: 0, pct: 0 };
+  if (!body || !body.messages) return { chars: 0, estimatedTokens: 0, pct200k: 0, pct100k: 0 };
   let total = 0;
   for (const msg of body.messages) {
     if (typeof msg.content === "string") total += msg.content.length;
