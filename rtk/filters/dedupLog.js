@@ -16,12 +16,12 @@ export function dedupLog(input) {
       runCount++;
       continue;
     }
-    if (runCount > 1) out.push(`  ... (${runCount} duplicate lines)`);
+    if (runCount > 1) out.push(`  ... (${runCount} consecutive identical lines)`);
     runCount = 1;
     out.push(line);
     prev = line;
   }
-  if (runCount > 1) out.push(`  ... (${runCount} duplicate lines)`);
+  if (runCount > 1) out.push(`  ... (${runCount} consecutive identical lines)`);
   if (out.length > DEDUP_LINE_MAX) {
     const head = out.slice(0, 100);
     const tail = out.slice(out.length - 50);

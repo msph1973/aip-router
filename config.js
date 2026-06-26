@@ -6,7 +6,7 @@ function parseTokens(str) {
   return str.split(",").map((entry, i) => {
     entry = entry.trim();
     const colon = entry.indexOf(":");
-    if (colon > 0 && colon < 20) {
+    if (colon > 0) {
       return { name: entry.slice(0, colon), token: entry.slice(colon + 1) };
     }
     return { name: `token${i}`, token: entry };

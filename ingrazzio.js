@@ -1,4 +1,5 @@
 import { CONFIG } from "./config.js";
+import { safeParseJson } from "./util.js";
 
 const INGRAZZIO_BASE = CONFIG.ingrazzioUrl;
 
@@ -69,10 +70,6 @@ function extractTextContent(msg) {
     return msg.content.filter(p => p.type === "text").map(p => p.text).join("\n");
   }
   return "";
-}
-
-function safeParseJson(str, fallback) {
-  try { return JSON.parse(str); } catch { return fallback; }
 }
 
 function translateContentToAnthropic(content) {

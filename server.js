@@ -1,14 +1,42 @@
 import express from "express";
+import crypto from "crypto";
 import { CONFIG } from "./config.js";
 import { compressMessages, formatRtkLog } from "./rtk/index.js";
 import { injectCaveman } from "./prompts/caveman.js";
 import { injectPonytail } from "./prompts/ponytail.js";
 import { addHeadroomWarning } from "./headroom.js";
 import { proxyToIngrazzio, translateOpenAIToAnthropic } from "./ingrazzio.js";
+import { safeParseJson } from "./util.js";
 
 const app = express();
+
 app.use(express.json({ limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: "text/plain" }));
+
+// CORS — required by most AI frontends (Open WebUI, LibreChat, Chatbox, etc.)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+// Structured logging with timestamps
+function log(level, ...args) {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] [${level}]`, ...args);
+}
+
+// Request ID for per-request tracing
+app.use((req, res, next) => {
+  req.reqId = crypto.randomUUID().slice(0, 8);
+  next();
+});
+
+// Token cooldown map — skip rate-limited tokens for a cooling period
+const tokenCooldowns = new Map();
+const COOLDOWN_MS = 30_000; // 30 seconds
 
 function detectModelFamily(model) {
   if (!model) return "openai";
@@ -51,8 +79,8 @@ function getToken(name) {
 function applyTokenSavers(body) {
   if (CONFIG.rtkEnabled) {
     const stats = compressMessages(body);
-    const log = formatRtkLog(stats);
-    if (log) console.log(log);
+    const msg = formatRtkLog(stats);
+    if (msg) log("rtk", msg);
   }
   if (CONFIG.cavemanEnabled) injectCaveman(body, CONFIG.cavemanLevel);
   if (CONFIG.ponytailEnabled) injectPonytail(body);
@@ -68,6 +96,12 @@ async function tryProxy(path, body, headers, tokenName) {
     : CONFIG.tokens.map(t => t.name);
 
   for (const name of order) {
+    // Skip tokens still in cooldown
+    const cooldownUntil = tokenCooldowns.get(name);
+    if (cooldownUntil && cooldownUntil > Date.now()) {
+      log("token", `${name} cooldown (${Math.ceil((cooldownUntil - Date.now()) / 1000)}s remaining), skipping...`);
+      continue;
+    }
     const token = CONFIG.tokens.find(t => t.name === name)?.token;
     if (!token) continue;
     const h = { ...headers, "Authorization": `Bearer ${token}` };
@@ -75,15 +109,16 @@ async function tryProxy(path, body, headers, tokenName) {
       const res = await proxyToIngrazzio(path, body, h);
       if (res.error) {
         if (res.status === 401 || res.status === 429 || res.status === 403) {
-          console.log(`[Token] ${name} failed (${res.status}), trying next...`);
+          if (res.status === 429) tokenCooldowns.set(name, Date.now() + COOLDOWN_MS);
+          log("token", `${name} ${res.status}, trying next...`);
           continue;
         }
         return res;
       }
-      console.log(`[Token] using ${name}`);
+      log("token", `using ${name}`);
       return res;
     } catch (e) {
-      console.log(`[Token] ${name} error: ${e.message}, trying next...`);
+      log("token", `${name} error: ${e.message}, trying next...`);
       continue;
     }
   }
@@ -96,6 +131,9 @@ app.all("/v1/chat/completions", async (req, res) => {
     try { body = JSON.parse(body); } catch { return res.status(400).json({ error: "invalid json" }); }
   }
   if (!body || !body.model) return res.status(400).json({ error: "model required" });
+
+  // Shallow-clone to avoid mutating original body (important for retry/debugging)
+  body = structuredClone(body);
 
   const modelInfo = resolveModel(body.model);
   if (!modelInfo) return res.status(400).json({ error: "unknown model" });
@@ -119,7 +157,7 @@ app.all("/v1/chat/completions", async (req, res) => {
       const anBody = translateOpenAIToAnthropic(body, modelInfo);
       const upstreamRes = await tryProxy(modelInfo.path, anBody, baseHeaders, modelInfo.tokenName);
       if (upstreamRes.error) {
-        const errBody = tryParse(upstreamRes.body);
+        const errBody = safeParseJson(upstreamRes.body);
         return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
       }
       if (isStream) {
@@ -139,7 +177,7 @@ app.all("/v1/chat/completions", async (req, res) => {
       if (isStream) body.stream_options = { include_usage: true };
       const upstreamRes = await tryProxy(modelInfo.path, body, baseHeaders, modelInfo.tokenName);
       if (upstreamRes.error) {
-        const errBody = tryParse(upstreamRes.body);
+        const errBody = safeParseJson(upstreamRes.body);
         return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
       }
       if (isStream) {
@@ -152,16 +190,24 @@ app.all("/v1/chat/completions", async (req, res) => {
       }
     }
   } catch (e) {
-    console.error("[Router] error:", e.message);
+    log("error", "Router error:", e.message);
     if (!res.headersSent) return res.status(502).json({ error: e.message });
     res.end();
   }
 });
 
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    tokens: CONFIG.tokens.map(t => ({ name: t.name, configured: !!t.token })),
+  // Check if any tokens are in cooldown
+  const tokens = CONFIG.tokens.map(t => {
+    const cd = tokenCooldowns.get(t.name);
+    return { name: t.name, configured: !!t.token, cooldown: cd && cd > Date.now() ? Math.ceil((cd - Date.now()) / 1000) : 0 };
+  });
+  const allExhausted = tokens.length > 0 && tokens.every(t => t.cooldown > 0);
+  const headers = {};
+  if (allExhausted) headers["Retry-After"] = String(Math.min(...tokens.map(t => t.cooldown || 0)) || 30);
+  res.set(headers).json({
+    status: allExhausted ? "degraded" : "ok",
+    tokens,
     features: {
       rtk: CONFIG.rtkEnabled,
       caveman: CONFIG.cavemanEnabled ? CONFIG.cavemanLevel : false,
@@ -172,20 +218,24 @@ app.get("/health", (req, res) => {
   });
 });
 
-function tryParse(s) { try { return JSON.parse(s); } catch { return null; } }
-
 async function pipeWebStream(readableStream, res) {
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();
+  const STREAM_TIMEOUT = 120_000; // 2min idle timeout
+  let timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
   try {
     while (true) {
       const { done, value } = await reader.read();
+      clearTimeout(timeout);
       if (done) { res.end(); return; }
       res.write(decoder.decode(value, { stream: true }));
+      timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
     }
   } catch (e) {
-    console.error("[pipe] stream error:", e.message);
+    log("error", "pipe stream:", e.message);
     if (!res.writableEnded) res.end();
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -194,14 +244,18 @@ async function pipeAnthropicStream(readableStream, res, modelInfo) {
   const decoder = new TextDecoder();
   let buffer = "";
   let hasSentFinish = false;
+  const STREAM_TIMEOUT = 120_000; // 2min idle timeout
+  let timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
 
   try {
     while (true) {
       const { done, value } = await reader.read();
+      clearTimeout(timeout);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
+      timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith(":") || trimmed.startsWith("event: ")) continue;
@@ -248,7 +302,8 @@ async function pipeAnthropicStream(readableStream, res, modelInfo) {
         }
       }
     }
-  } catch (e) { console.error("[Anthropic SSE] error:", e.message); }
+  } catch (e) { log("error", "Anthropic SSE:", e.message); }
+  finally { clearTimeout(timeout); }
   if (!hasSentFinish) res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, index: 0, finish_reason: "stop" }], usage: null })}\n\n`);
   res.write("data: [DONE]\n\n"); res.end();
 }
@@ -279,9 +334,22 @@ function translateAnthropicResponseToOpenAI(anBody, modelInfo) {
 }
 
 const PORT = CONFIG.port;
-app.listen(PORT, () => {
-  console.log(`\n  AIP Router running at http://localhost:${PORT}`);
-  console.log(`  Endpoint: http://localhost:${PORT}/v1/chat/completions`);
-  for (const t of CONFIG.tokens) console.log(`  Token: ${t.name} (${!!t.token})`);
-  console.log(`  RTK: ${CONFIG.rtkEnabled ? "ON" : "OFF"} | Caveman: ${CONFIG.cavemanEnabled ? CONFIG.cavemanLevel : "OFF"} | Ponytail: ${CONFIG.ponytailEnabled ? "ON" : "OFF"} | Headroom: ${CONFIG.headroomEnabled ? "ON" : "OFF"}\n`);
+const httpServer = app.listen(PORT, () => {
+  log("info", `\n  AIP Router running at http://localhost:${PORT}`);
+  log("info", `  Endpoint: http://localhost:${PORT}/v1/chat/completions`);
+  for (const t of CONFIG.tokens) log("info", `  Token: ${t.name} (${!!t.token})`);
+  log("info", `  RTK: ${CONFIG.rtkEnabled ? "ON" : "OFF"} | Caveman: ${CONFIG.cavemanEnabled ? CONFIG.cavemanLevel : "OFF"} | Ponytail: ${CONFIG.ponytailEnabled ? "ON" : "OFF"} | Headroom: ${CONFIG.headroomEnabled ? "ON" : "OFF"}\n`);
 });
+
+// Graceful shutdown — close server cleanly on SIGTERM/SIGINT
+function shutdown(signal) {
+  log("info", `Received ${signal}, shutting down gracefully...`);
+  httpServer.close(() => {
+    log("info", "Server closed");
+    process.exit(0);
+  });
+  // Force exit after 5s if still hanging
+  setTimeout(() => { log("warn", "Force exit after timeout"); process.exit(1); }, 5000);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
