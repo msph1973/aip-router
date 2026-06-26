@@ -1,0 +1,185 @@
+#!/usr/bin/env node
+import blessed from "blessed";
+import { spawn } from "child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CONFIG_DIR = join(homedir(), ".aip-router");
+const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+
+let server = null;
+let reqCount = 0;
+let tokensIn = 0;
+let tokensOut = 0;
+let rtkSaved = 0;
+let rtkTotalBytes = 0;
+let healthInterval = null;
+const logEntries = [];
+
+const config = existsSync(CONFIG_PATH)
+  ? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
+  : { tokens: [], port: 20129, rtkEnabled: true, cavemanEnabled: false,
+      cavemanLevel: "full", ponytailEnabled: false, headroomEnabled: false, headroomThreshold: 80 };
+
+function saveConfig() {
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+// ---- Blessed Setup ----
+const screen = blessed.screen({ smartCSR: true, title: "AIP Router", dockBorders: true, fullUnicode: true });
+
+const header = blessed.box({ top: 0, left: 0, width: "100%", height: 1, tags: true,
+  content: ` AIP Router v1.0    {red-fg}●{/red-fg} stopped    http://localhost:${config.port} `,
+  style: { bg: "black", fg: "white" } });
+
+const configBox = blessed.box({ top: 1, left: 0, width: "40%", bottom: 1, label: " Config ", border: { type: "line" },
+  tags: true, scrollable: true, alwaysScroll: true, style: { border: { fg: "cyan" } } });
+
+const logBox = blessed.box({ top: 1, left: "40%", width: "60%", bottom: 1, label: " Request Log ", border: { type: "line" },
+  tags: true, scrollable: true, alwaysScroll: true, style: { border: { fg: "green" } } });
+
+const footer = blessed.box({ bottom: 0, left: 0, width: "100%", height: 1, tags: true,
+  content: " {bold}s{/bold}Start  {bold}x{/bold}Stop  {bold}1-4{/bold}Toggle  {bold}t{/bold}Token  {bold}p{/bold}Port  {bold}q{/bold}Quit",
+  style: { bg: "black", fg: "white" } });
+
+screen.append(header); screen.append(configBox); screen.append(logBox); screen.append(footer);
+
+// ---- Render ----
+function render() {
+  const lines = [];
+  lines.push("");
+  for (const t of config.tokens) {
+    lines.push(` {bold}${t.name}{/bold}  ${t.token ? "{green-fg}✓{/green-fg}" : "{red-fg}✗{/red-fg}"}`);
+  }
+  lines.push("");
+  lines.push(` Port:  {cyan-fg}${config.port}{/cyan-fg}`);
+  lines.push("");
+  lines.push(` {bold}Features{/bold}`);
+  lines.push(`   ${config.rtkEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} RTK      ${config.rtkEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}`);
+  lines.push(`   ${config.cavemanEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} Caveman  ${config.cavemanEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}  [{yellow-fg}${config.cavemanLevel}{/yellow-fg}]`);
+  lines.push(`   ${config.ponytailEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} Ponytail ${config.ponytailEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}`);
+  lines.push(`   ${config.headroomEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} Headroom ${config.headroomEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}`);
+  lines.push("");
+  lines.push(` {bold}Stats{/bold}`);
+  lines.push(`   Requests:  {cyan-fg}${reqCount}{/cyan-fg}`);
+  lines.push(`   Tokens in: {cyan-fg}${tokensIn.toLocaleString()}{/cyan-fg}`);
+  if (rtkTotalBytes > 0) lines.push(`   RTK saved: {green-fg}${rtkSaved.toLocaleString()}B{/green-fg} (${((rtkSaved/rtkTotalBytes)*100).toFixed(1)}%)`);
+  configBox.setContent(lines.join("\n"));
+  screen.render();
+}
+
+function addLog(text, color = "white") {
+  const t = new Date().toLocaleTimeString();
+  logEntries.push(`  {${color}-fg}${t}{/${color}-fg} ${text}`);
+  if (logEntries.length > 100) logEntries.shift();
+  logBox.setContent(logEntries.join("\n"));
+  logBox.setScrollPerc(100);
+  screen.render();
+}
+
+// ---- Server ----
+function startServer() {
+  if (!config.tokens.some(t => t.token)) { addLog("Set at least one token (press t)", "red"); return; }
+  if (server) { addLog("Already running", "yellow"); return; }
+
+  const tokenStr = config.tokens.map(t => `${t.name}:${t.token}`).join(",");
+  server = spawn(process.execPath, [join(__dirname, "../server.js")], {
+    env: { AIP_TOKENS: tokenStr, PORT: String(config.port),
+      RTK_ENABLED: String(config.rtkEnabled), CAVEMAN_ENABLED: String(config.cavemanEnabled),
+      CAVEMAN_LEVEL: config.cavemanLevel, PONYTAIL_ENABLED: String(config.ponytailEnabled),
+      HEADROOM_ENABLED: String(config.headroomEnabled), HEADROOM_THRESHOLD: String(config.headroomThreshold) },
+    cwd: join(__dirname, ".."), stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  server.stdout.on("data", d => {
+    for (const line of d.toString().trim().split("\n")) {
+      if (!line) continue;
+      if (line.includes("[Token]")) addLog(line.trim(), "cyan");
+      else if (line.includes("[RTK]")) {
+        const m = line.match(/saved (\d+)B.*\(([\d.]+)%\)/);
+        if (m) { rtkSaved += parseInt(m[1]); rtkTotalBytes += parseInt(m[1]) / (parseFloat(m[2]) / 100); }
+        addLog(line.trim(), "green");
+      } else addLog(line.trim(), "white");
+    }
+  });
+
+  server.stderr.on("data", d => {
+    const text = d.toString().trim();
+    if (!text) return;
+    addLog(text, "red");
+    const log = existsSync(join(CONFIG_DIR, "server.log")) ? readFileSync(join(CONFIG_DIR, "server.log"), "utf8") : "";
+    writeFileSync(join(CONFIG_DIR, "server.log"), log + text + "\n");
+  });
+
+  server.on("exit", code => {
+    server = null;
+    header.setContent(` AIP Router v1.0    ${code === 0 ? "{green-fg}●{/green-fg}" : "{red-fg}●{/red-fg}"} ${code === 0 ? "stopped" : `crashed (${code})`}    http://localhost:${config.port} `);
+    addLog(`Server ${code === 0 ? "stopped" : `exited (${code})`}`, code === 0 ? "green" : "red");
+    if (healthInterval) { clearInterval(healthInterval); healthInterval = null; }
+    screen.render();
+  });
+
+  server.on("spawn", () => {
+    header.setContent(` AIP Router v1.0    {green-fg}●{/green-fg} running    http://localhost:${config.port} `);
+    addLog("Server started", "green");
+    screen.render();
+    healthInterval = setInterval(pollHealth, 3000);
+  });
+}
+
+function stopServer() {
+  if (!server) { addLog("Not running", "yellow"); return; }
+  server.kill("SIGTERM"); server = null;
+  if (healthInterval) { clearInterval(healthInterval); healthInterval = null; }
+  header.setContent(` AIP Router v1.0    {red-fg}●{/red-fg} stopped    http://localhost:${config.port} `);
+  addLog("Stopping...", "yellow"); screen.render();
+}
+
+async function pollHealth() {
+  try { await fetch(`http://localhost:${config.port}/health`); } catch {}
+}
+
+// ---- Input ----
+function promptInput(question, callback) {
+  const prompt = blessed.prompt({ parent: screen, border: "line", height: 5, width: "60%",
+    top: "center", left: "center", label: ` ${question} `, tags: true,
+    style: { border: { fg: "cyan" }, bg: "black", fg: "white" } });
+  prompt.input("", "", (err, value) => { prompt.destroy(); screen.render(); if (value) callback(value.trim()); });
+}
+
+function addToken(name) {
+  promptInput(`Token for "${name}" (perm-...)`, val => {
+    const existing = config.tokens.findIndex(t => t.name === name);
+    if (existing >= 0) config.tokens[existing].token = val;
+    else config.tokens.push({ name, token: val });
+    saveConfig(); render(); addLog(`Token "${name}" ${val ? "set" : "cleared"}`, "green");
+  });
+}
+
+screen.key(["1"], () => { config.rtkEnabled = !config.rtkEnabled; saveConfig(); render(); });
+screen.key(["2"], () => { config.cavemanEnabled = !config.cavemanEnabled; saveConfig(); render(); });
+screen.key(["3"], () => { config.ponytailEnabled = !config.ponytailEnabled; saveConfig(); render(); });
+screen.key(["4"], () => { config.headroomEnabled = !config.headroomEnabled; saveConfig(); render(); });
+screen.key(["s", "S"], startServer);
+screen.key(["x", "X"], stopServer);
+screen.key(["t", "T"], () => promptInput("Token name (e.g. aip, junp):", addToken));
+screen.key(["p", "P"], () => {
+  promptInput("Port", val => { const n = parseInt(val); if (n > 0) { config.port = n; saveConfig(); render(); } });
+});
+screen.key(["c", "C"], () => {
+  promptInput("Caveman level (lite/full/ultra)", val => {
+    if (["lite","full","ultra"].includes(val)) { config.cavemanLevel = val; saveConfig(); render(); }
+  });
+});
+screen.key(["q", "Q"], () => { stopServer(); process.exit(0); });
+screen.key(["escape"], () => process.exit(0));
+
+screen.render(); render();
+addLog("Ready. Press t to add tokens, s to start", "cyan");
+
+// Auto-start if tokens configured
+if (config.tokens.some(t => t.token)) setTimeout(startServer, 500);

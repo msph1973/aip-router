@@ -1,0 +1,19 @@
+{
+  "name": "aip-router",
+  "version": "1.0.0",
+  "description": "Personal AI router for JetBrains AIP Ingrazzio with RTK/Caveman/Ponytail/Headroom",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "aip-router": "./bin/aip-router"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "cli": "node bin/aip-router"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "express": "^4.18.2"
+  }
+}

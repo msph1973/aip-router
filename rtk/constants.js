@@ -1,0 +1,16 @@
+export const RAW_CAP = 10 * 1024 * 1024;
+export const MIN_COMPRESS_SIZE = 500;
+export const DETECT_WINDOW = 1024;
+export const GIT_DIFF_HUNK_MAX_LINES = 100;
+export const DEDUP_LINE_MAX = 2000;
+export const GREP_PER_FILE_MAX = 10;
+export const FIND_PER_DIR_MAX = 10;
+export const FIND_TOTAL_DIR_MAX = 20;
+export const STATUS_MAX_FILES = 10;
+export const STATUS_MAX_UNTRACKED = 10;
+export const LS_EXT_SUMMARY_TOP = 5;
+export const LS_NOISE_DIRS = ["node_modules", ".git", "target", "__pycache__", ".next", "dist", "build", ".venv", "venv", ".cache", ".idea", ".vscode", ".DS_Store"];
+export const TREE_MAX_LINES = 200;
+export const SMART_TRUNCATE_HEAD = 120;
+export const SMART_TRUNCATE_TAIL = 60;
+export const SMART_TRUNCATE_MIN_LINES = 250;

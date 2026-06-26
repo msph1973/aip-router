@@ -1,0 +1,153 @@
+#!/usr/bin/env node
+import { createInterface } from "readline";
+import { spawn } from "child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CONFIG_DIR = join(homedir(), ".aip-router");
+const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+const LOG_PATH = join(CONFIG_DIR, "server.log");
+
+let server = null;
+let state = "menu"; // menu | ask_token | ask_port | ask_caveman | ask_headroom
+let config = loadConfig();
+
+function loadConfig() {
+  if (existsSync(CONFIG_PATH)) {
+    try { return JSON.parse(readFileSync(CONFIG_PATH, "utf8")); } catch {}
+  }
+  return { aipToken: "", port: 20129, rtkEnabled: true, cavemanEnabled: false,
+    cavemanLevel: "full", ponytailEnabled: false, headroomEnabled: false, headroomThreshold: 80 };
+}
+
+function saveConfig() {
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+function clear() { process.stdout.write("\x1b[2J\x1b[H"); }
+function c(text, code) { return `\x1b[${code}m${text}\x1b[0m`; }
+const green = t => c(t, "32"), yellow = t => c(t, "33"), red = t => c(t, "31"), cyan = t => c(t, "36"), bold = t => c(t, "1"), dim = t => c(t, "2");
+const onOff = v => v ? green("ON") : dim("OFF");
+
+function showMenu() {
+  clear();
+  console.log(`  ${bold("AIP Router")}  ${dim("v1.0 — Interactive CLI")}`);
+  console.log(`  ${dim("─".repeat(40))}`);
+  console.log(`  Port:   ${cyan(String(config.port))}    Token: ${config.aipToken ? green("✓") : red("✗")}`);
+  console.log(`  Server: ${server ? green("RUNNING") : dim("stopped")}`);
+  console.log(`  ${dim("─".repeat(40))}`);
+  console.log(`    ${config.rtkEnabled ? green("●") : dim("○")} 1  RTK Token Saver     ${onOff(config.rtkEnabled)}`);
+  console.log(`    ${config.cavemanEnabled ? green("●") : dim("○")} 2  Caveman Mode       ${onOff(config.cavemanEnabled)}  [${config.cavemanLevel}]`);
+  console.log(`    ${config.ponytailEnabled ? green("●") : dim("○")} 3  Ponytail Mode      ${onOff(config.ponytailEnabled)}`);
+  console.log(`    ${config.headroomEnabled ? green("●") : dim("○")} 4  Headroom Token     ${onOff(config.headroomEnabled)}`);
+  console.log(`  ${dim("─".repeat(40))}`);
+  console.log(`    ${dim("t")}  Set token    ${dim("p")}  Set port`);
+  console.log(`    ${dim("s")}  Start        ${dim("x")}  Stop`);
+  console.log(`    ${dim("l")}  Logs         ${dim("q")}  Quit`);
+  console.log(`  ${dim("─".repeat(40))}`);
+}
+
+const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+
+rl.on("line", line => {
+  const v = line.trim();
+
+  switch (state) {
+    case "ask_token":
+      if (v) { config.aipToken = v; saveConfig(); console.log(green("  Token saved")); }
+      state = "menu"; showMenu(); break;
+
+    case "ask_port":
+      if (v) { config.port = parseInt(v) || 20129; saveConfig(); console.log(green(`  Port set to ${config.port}`)); }
+      state = "menu"; showMenu(); break;
+
+    case "ask_caveman":
+      if (["lite", "full", "ultra"].includes(v)) { config.cavemanLevel = v; saveConfig(); console.log(green(`  Caveman: ${v}`)); }
+      else console.log(yellow("  Invalid, use: lite/full/ultra"));
+      state = "menu"; showMenu(); break;
+
+    case "ask_headroom":
+      { const n = parseInt(v); if (n >= 0 && n <= 100) { config.headroomThreshold = n; saveConfig(); console.log(green(`  Threshold: ${n}%`)); }
+      else console.log(yellow("  0-100")); }
+      state = "menu"; showMenu(); break;
+
+    default:
+      switch (v) {
+        case "1": config.rtkEnabled = !config.rtkEnabled; saveConfig(); showMenu(); break;
+        case "2": config.cavemanEnabled = !config.cavemanEnabled; saveConfig(); showMenu(); break;
+        case "3": config.ponytailEnabled = !config.ponytailEnabled; saveConfig(); showMenu(); break;
+        case "4": config.headroomEnabled = !config.headroomEnabled; saveConfig(); showMenu(); break;
+        case "t": state = "ask_token"; console.log(`  ${dim("Paste AIP token (perm-...):")}`); break;
+        case "p": state = "ask_port"; console.log(`  ${dim("Port number:")}`); break;
+        case "c": state = "ask_caveman"; console.log(`  ${dim("Level (lite/full/ultra):")}`); break;
+        case "h": state = "ask_headroom"; console.log(`  ${dim("Threshold % (0-100):")}`); break;
+        case "s": startServer(); break;
+        case "x": stopServer(); showMenu(); break;
+        case "l": showLogs(); break;
+        case "q": cleanup(); return;
+      }
+  }
+});
+
+function startServer() {
+  if (!config.aipToken) { console.log(red("  Set token first (press t)")); return; }
+  if (server) { console.log(yellow("  Already running")); return; }
+
+  const env = { AIP_TOKEN: config.aipToken, PORT: String(config.port),
+    RTK_ENABLED: String(config.rtkEnabled), CAVEMAN_ENABLED: String(config.cavemanEnabled),
+    CAVEMAN_LEVEL: config.cavemanLevel, PONYTAIL_ENABLED: String(config.ponytailEnabled),
+    HEADROOM_ENABLED: String(config.headroomEnabled), HEADROOM_THRESHOLD: String(config.headroomThreshold) };
+
+  server = spawn(process.execPath, [join(__dirname, "../server.js")], { env, cwd: join(__dirname, ".."), stdio: ["ignore", "pipe", "pipe"] });
+  server.stdout.on("data", d => { for (const l of d.toString().trim().split("\n")) if (l) console.log(`  ${dim("│")} ${l}`); });
+  server.stderr.on("data", d => {
+    const text = d.toString().trim();
+    if (!text) return;
+    console.log(`  ${red("│")} ${text}`);
+    const log = existsSync(LOG_PATH) ? readFileSync(LOG_PATH, "utf8") : "";
+    writeFileSync(LOG_PATH, log + text + "\n");
+  });
+  server.on("exit", code => {
+    console.log(`  ${code === 0 ? green("Exited") : red(`Exited (${code})`)}`);
+    server = null;
+    showMenu();
+  });
+  server.on("spawn", () => {
+    setTimeout(() => {
+      if (server && server.exitCode === null) {
+        console.log(green(`  → http://localhost:${config.port}/v1/chat/completions`));
+      }
+    }, 1500);
+  });
+}
+
+function stopServer() {
+  if (!server) { console.log(yellow("  Not running")); return; }
+  server.kill("SIGTERM");
+  server = null;
+  console.log(green("  Stopped"));
+}
+
+function showLogs() {
+  if (existsSync(LOG_PATH)) {
+    const log = readFileSync(LOG_PATH, "utf8");
+    const lines = log.split("\n").filter(Boolean);
+    const show = lines.slice(-30);
+    console.log(`  ${dim("─".repeat(40))}`);
+    for (const l of show) console.log(`  ${dim(l.slice(0, 120))}`);
+    console.log(`  ${dim("─".repeat(40))}`);
+  } else console.log(dim("  No logs"));
+}
+
+function cleanup() {
+  stopServer();
+  rl.close();
+  process.exit(0);
+}
+
+process.on("SIGINT", cleanup);
+showMenu();
