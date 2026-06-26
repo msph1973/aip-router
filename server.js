@@ -40,7 +40,9 @@ const COOLDOWN_MS = 30_000; // 30 seconds
 
 function detectModelFamily(model) {
   if (!model) return "openai";
-  const m = model.toLowerCase();
+  // Use the part after the last "/" for detection (handles "aip/claude-sonnet-4-6")
+  const modelPart = model.includes("/") ? model.split("/").pop() : model;
+  const m = modelPart.toLowerCase();
   if (m.startsWith("claude")) return "anthropic";
   if (m.startsWith("gpt") || m.startsWith("o1") || m.startsWith("o3")) return "openai";
   if (m.startsWith("gemini")) return "gemini";
@@ -51,15 +53,17 @@ function resolveModel(model) {
   if (!model) return null;
   // Take first model if comma-separated list (Hermes fallback etc.)
   const single = model.split(",")[0].trim();
-  // Support "tokenname/modelname" syntax
+  // Support "tokenname/modelname" syntax.  If the prefix matches a configured
+  // token, route to that token.  Otherwise the prefix is still stripped from
+  // the model name (common case: user has bare token but passes "aip/gpt-4o").
   let tokenName = null;
   let modelName = single;
   const slash = single.indexOf("/");
   if (slash > 0) {
     const prefix = single.slice(0, slash);
+    modelName = single.slice(slash + 1);
     if (CONFIG.tokens.some(t => t.name === prefix)) {
       tokenName = prefix;
-      modelName = single.slice(slash + 1);
     }
   }
   const family = detectModelFamily(modelName);
