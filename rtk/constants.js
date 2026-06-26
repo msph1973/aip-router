@@ -10,7 +10,6 @@ export const STATUS_MAX_FILES = 10;
 export const STATUS_MAX_UNTRACKED = 10;
 export const LS_EXT_SUMMARY_TOP = 5;
 export const LS_NOISE_DIRS = ["node_modules", ".git", "target", "__pycache__", ".next", "dist", "build", ".venv", "venv", ".cache", ".idea", ".vscode", ".DS_Store"];
-export const TREE_MAX_LINES = 200;
 export const SMART_TRUNCATE_HEAD = 120;
 export const SMART_TRUNCATE_TAIL = 60;
 export const SMART_TRUNCATE_MIN_LINES = 250;

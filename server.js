@@ -10,8 +10,6 @@ const app = express();
 app.use(express.json({ limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: "text/plain" }));
 
-const DEFAULT_TOKEN_NAME = CONFIG.tokens[0]?.name || "aip";
-
 function detectModelFamily(model) {
   if (!model) return "openai";
   const m = model.toLowerCase();
