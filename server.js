@@ -21,15 +21,17 @@ function detectModelFamily(model) {
 
 function resolveModel(model) {
   if (!model) return null;
+  // Take first model if comma-separated list (Hermes fallback etc.)
+  const single = model.split(",")[0].trim();
   // Support "tokenname/modelname" syntax
   let tokenName = null;
-  let modelName = model;
-  const slash = model.indexOf("/");
+  let modelName = single;
+  const slash = single.indexOf("/");
   if (slash > 0) {
-    const prefix = model.slice(0, slash);
+    const prefix = single.slice(0, slash);
     if (CONFIG.tokens.some(t => t.name === prefix)) {
       tokenName = prefix;
-      modelName = model.slice(slash + 1);
+      modelName = single.slice(slash + 1);
     }
   }
   const family = detectModelFamily(modelName);
