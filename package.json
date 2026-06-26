@@ -1,7 +1,7 @@
 {
   "name": "aip-router",
   "version": "1.0.0",
-  "description": "Personal AI router for JetBrains AIP Ingrazzio with RTK/Caveman/Ponytail/Headroom",
+  "description": "Personal AI router for AIP Ingrazzio with RTK/Caveman/Ponytail/Headroom",
   "type": "module",
   "main": "server.js",
   "bin": {

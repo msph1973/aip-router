@@ -1,6 +1,6 @@
 # AIP Router
 
-Router API pribadi untuk JetBrains AIP (AI Assistant) yang mem-proxy ke **Ingrazzio** (production endpoint JetBrains AI). Mendukung multi-token, format translation (OpenAI ↔ Anthropic), streaming, dan berbagai fitur penghemat token.
+Router API pribadi yang mem-proxy ke **Ingrazzio** (production endpoint). Mendukung multi-token, format translation (OpenAI ↔ Anthropic), streaming, dan berbagai fitur penghemat token.
 
 ## Fitur
 
@@ -40,7 +40,7 @@ npm link   # bikin global symlink untuk aip-router dan aip-tui
 ### Token Sources
 
 Token bisa didapat dari:
-- JetBrains IDE → Help → AI Assistant License → Copy token (format `perm-xxx`)
+- IDE → Help → AI License → Copy token (format `perm-xxx`)
 - File `~/.junie/secure_credentials.json`
 
 Tipe token yang sudah terverifikasi:
