@@ -5,7 +5,8 @@
   "type": "module",
   "main": "server.js",
   "bin": {
-    "aip-router": "./bin/aip-router"
+    "aip-router": "./bin/aip-router",
+    "aip-tui": "./bin/aip-tui"
   },
   "scripts": {
     "start": "node server.js",
