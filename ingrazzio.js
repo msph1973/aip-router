@@ -58,8 +58,19 @@ export function translateOpenAIToAnthropic(body, modelInfo) {
   if (system) anBody.system = system;
   anBody.messages = messages.length > 0 ? messages : [{ role: "user", content: "hello" }];
 
-  // Add tools if present
-  if (body.tools) anBody.tools = body.tools;
+  // Translate tools from OpenAI format to Anthropic format
+  if (body.tools) {
+    anBody.tools = body.tools.map(t => {
+      if (t.type === "function" && t.function) {
+        return {
+          name: t.function.name,
+          description: t.function.description || "",
+          input_schema: t.function.parameters || {},
+        };
+      }
+      return t;
+    });
+  }
 
   return anBody;
 }
