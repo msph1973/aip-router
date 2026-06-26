@@ -51,15 +51,17 @@ function detectModelFamily(model) {
 
 function resolveModel(model) {
   if (!model) return null;
+  // Take first model if comma-separated list (Hermes fallback etc.)
+  const single = model.split(",")[0].trim();
   // Support "tokenname/modelname" syntax.  If the prefix matches a configured
   // token, route to that token.  Otherwise the prefix is still stripped from
   // the model name (common case: user has bare token but passes "aip/gpt-4o").
   let tokenName = null;
-  let modelName = model;
-  const slash = model.indexOf("/");
+  let modelName = single;
+  const slash = single.indexOf("/");
   if (slash > 0) {
-    const prefix = model.slice(0, slash);
-    modelName = model.slice(slash + 1);
+    const prefix = single.slice(0, slash);
+    modelName = single.slice(slash + 1);
     if (CONFIG.tokens.some(t => t.name === prefix)) {
       tokenName = prefix;
     }
