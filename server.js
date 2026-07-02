@@ -136,6 +136,12 @@ app.all("/v1/chat/completions", async (req, res) => {
   }
   if (!body || !body.model) return res.status(400).json({ error: "model required" });
 
+  // Request logger — dump model, tools, messages summary to stderr for debugging
+  const toolNames = (body.tools || []).map(t => t.function?.name || t.name || "?").join(",");
+  const msgSummary = (body.messages || []).map(m => `${m.role}:${typeof m.content === "string" ? m.content.length : Array.isArray(m.content) ? `parts[${m.content.length}]` : "?"}`);
+  const approxTokens = JSON.stringify(body).length / 3.5;
+  log("req", `[${req.reqId}] model=${body.model} stream=${!!body.stream} tools=[${toolNames}] msgs=[${msgSummary.join("|")}] ~${Math.ceil(approxTokens)}tok`);
+
   // Shallow-clone to avoid mutating original body (important for retry/debugging)
   body = structuredClone(body);
 
