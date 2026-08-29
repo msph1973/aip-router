@@ -5,7 +5,7 @@ import { compressMessages, formatRtkLog } from "./rtk/index.js";
 import { injectCaveman } from "./prompts/caveman.js";
 import { injectPonytail } from "./prompts/ponytail.js";
 import { addHeadroomWarning } from "./headroom.js";
-import { proxyToIngrazzio, translateOpenAIToAnthropic } from "./ingrazzio.js";
+import { proxyToIngrazzio, translateOpenAIToAnthropic, translateOpenAIToGoogle, translateGoogleResponseToOpenAI, getBreakerState } from "./ingrazzio.js";
 import { safeParseJson } from "./util.js";
 
 const app = express();
@@ -67,12 +67,29 @@ function resolveModel(model) {
     }
   }
   const family = detectModelFamily(modelName);
-  return {
-    original: model, modelName, tokenName,
-    family,
-    path: family === "anthropic" ? "/v1/messages" : "/v1/chat/completions",
-    llmModel: family === "anthropic" ? "anthropic" : family === "gemini" ? "google" : "openai",
-  };
+
+  // Map model → upstream path + x-llm-model matching Junie CLI's behavior
+  // (captured from real Junie requests to Ingrazzio)
+  let path, llmModel, streamPath = null;
+  if (family === "anthropic") {
+    path = "/v1/messages";
+    llmModel = "anthropic";
+  } else if (family === "gemini") {
+    // Junie uses Google Vertex-style path for gemini models
+    const base = `/v1beta1/projects/jetbrains-grazie/locations/global/publishers/google/models/${modelName}`;
+    path = `${base}:generateContent`;
+    streamPath = `${base}:streamGenerateContent?alt=sse`;
+    llmModel = "google";
+  } else if (modelName.startsWith("deepseek")) {
+    // Junie routes deepseek family through /compatible-mode with x-llm-model: alicloud
+    path = "/compatible-mode/v1/chat/completions";
+    llmModel = "alicloud";
+  } else {
+    path = "/v1/chat/completions";
+    llmModel = "openai";
+  }
+
+  return { original: model, modelName, tokenName, family, path, streamPath, llmModel };
 }
 
 function getToken(name) {
@@ -154,13 +171,33 @@ app.all("/v1/chat/completions", async (req, res) => {
 
   applyTokenSavers(body);
   const baseHeaders = {
+    "User-Agent": CONFIG.junieUserAgent,
+    "Grazie-Agent": JSON.stringify({ name: "junie:cli", version: CONFIG.junieVersion }),
     "X-LLM-Model": modelInfo.llmModel,
     "X-Keep-Path": "true",
     "X-Accept-EAP-License": "true",
-    "X-Accept-Release-License": "true",
+    "X-Accept-Release-License": "false",
+    "X-Client-Execution-Id": "session-" + (() => {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, "0");
+      const rand = Math.random().toString(36).slice(2, 6);
+      return `${d.getFullYear().toString().slice(2)}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${rand}`;
+    })(),
+    "X-Client-Feature-Id": `junie-cli/${CONFIG.junieVersion}`,
+    "Accept": "text/event-stream,application/json",
+    "Accept-Encoding": "identity",
     "Content-Type": "application/json",
-    "User-Agent": "aip-router/1.0",
   };
+
+  // Add version headers matching Junie's per-family routing
+  if (modelInfo.family === "anthropic") {
+    baseHeaders["Anthropic-Version"] = "2023-06-01";
+  } else if (modelInfo.family === "gemini") {
+    // Google Vertex API doesn't use OpenAI/Anthropic version headers
+    // Junie sends no version header for gemini (from capture)
+  } else {
+    baseHeaders["Openai-Version"] = "2020-11-07";
+  }
 
   try {
     if (modelInfo.family === "anthropic") {
@@ -178,6 +215,24 @@ app.all("/v1/chat/completions", async (req, res) => {
       } else {
         const json = await upstreamRes.json();
         res.json(translateAnthropicResponseToOpenAI(json, modelInfo));
+      }
+    } else if (modelInfo.family === "gemini") {
+      const gBody = translateOpenAIToGoogle(body, modelInfo);
+      // Streaming uses Vertex SSE endpoint so we can translate each SSE chunk
+      const gPath = isStream ? modelInfo.streamPath : modelInfo.path;
+      const upstreamRes = await tryProxy(gPath, gBody, baseHeaders, modelInfo.tokenName);
+      if (upstreamRes.error) {
+        const errBody = safeParseJson(upstreamRes.body);
+        return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
+      }
+      if (isStream) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        await pipeGoogleStream(upstreamRes.body, res, modelInfo);
+      } else {
+        const json = await upstreamRes.json();
+        res.json(translateGoogleResponseToOpenAI(json, modelInfo));
       }
     } else {
       if (body.max_tokens && !body.max_completion_tokens) {
@@ -206,7 +261,172 @@ app.all("/v1/chat/completions", async (req, res) => {
   }
 });
 
+// --- OpenAI Responses API (/v1/responses) support ---
+// Junie CLI's pipeline hits /v1/responses for its classifier and some tools.
+// We translate Responses-API input into a chat completion, proxy to the same
+// upstream path as /v1/chat/completions, then translate back.
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (instructions) messages.push({ role: "system", content: typeof instructions === "string" ? instructions : JSON.stringify(instructions) });
+  if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+  } else if (Array.isArray(input)) {
+    for (const item of input) {
+      if (item.type === "function_call" || item.type === "function_call_output" || item.type === "reasoning") continue;
+      if (item.type === "message" || item.role) {
+        const role = item.type === "message" ? (item.role || "user") : (item.role || "user");
+        let content = item.content;
+        if (Array.isArray(content)) {
+          content = content.map(p => p.type === "output_text" || p.type === "input_text" ? p.text : p.type === "text" ? p.text : JSON.stringify(p)).join("");
+        }
+        messages.push({ role, content });
+      } else if (typeof item === "string") {
+        messages.push({ role: "user", content: item });
+      } else {
+        // {role, content} raw form
+        messages.push({ role: item.role || "user", content: typeof item.content === "string" ? item.content : JSON.stringify(item.content) });
+      }
+    }
+  }
+  if (!messages.some(m => m.role === "user")) messages.push({ role: "user", content: "hi" });
+  return messages;
+}
+
+function chatToResponsesOutput(openaiJson, modelInfo) {
+  const choice = openaiJson.choices && openaiJson.choices[0];
+  const msg = choice?.message || {};
+  const text = typeof msg.content === "string" ? msg.content : Array.isArray(msg.content) ? msg.content.map(p => p.text || "").join("") : "";
+  return {
+    id: openaiJson.id || `resp_${Date.now()}`,
+    object: "response",
+    created_at: openaiJson.created || Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: modelInfo.modelName,
+    output: [
+      {
+        type: "message",
+        id: `msg_${Date.now()}`,
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      },
+    ],
+    usage: openaiJson.usage ? {
+      input_tokens: openaiJson.usage.prompt_tokens || 0,
+      output_tokens: openaiJson.usage.completion_tokens || 0,
+      total_tokens: openaiJson.usage.total_tokens || 0,
+    } : null,
+  };
+}
+
+app.all("/v1/responses", async (req, res) => {
+  const body = typeof req.body === "string" ? safeParseJson(req.body) : req.body;
+  if (!body?.model) return res.status(400).json({ error: "model required" });
+
+  const modelInfo = resolveModel(body.model);
+  if (!modelInfo) return res.status(400).json({ error: "unknown model" });
+  if (!CONFIG.tokens.length) return res.status(400).json({ error: "no tokens configured" });
+
+  const isStream = body.stream === true;
+  // Build a chat-completion-shaped payload the existing family branches understand
+  const chatBody = {
+    model: modelInfo.modelName,
+    messages: responsesInputToMessages(body.input, body.instructions),
+    stream: isStream,
+  };
+  if (body.max_output_tokens) chatBody.max_tokens = body.max_output_tokens;
+  if (body.temperature !== undefined) chatBody.temperature = body.temperature;
+  if (body.top_p !== undefined) chatBody.top_p = body.top_p;
+
+  applyTokenSavers(chatBody);
+  const baseHeaders = {
+    "User-Agent": CONFIG.junieUserAgent,
+    "Grazie-Agent": JSON.stringify({ name: "junie:cli", version: CONFIG.junieVersion }),
+    "X-LLM-Model": modelInfo.llmModel,
+    "X-Keep-Path": "true",
+    "X-Accept-EAP-License": "true",
+    "X-Accept-Release-License": "false",
+    "X-Client-Execution-Id": "session-" + (() => { const d = new Date(); const pad = n => String(n).padStart(2, "0"); const rand = Math.random().toString(36).slice(2, 6); return `${d.getFullYear().toString().slice(2)}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${rand}`; })(),
+    "X-Client-Feature-Id": `junie-cli/${CONFIG.junieVersion}`,
+    "Accept": "text/event-stream,application/json",
+    "Accept-Encoding": "identity",
+    "Content-Type": "application/json",
+  };
+  if (modelInfo.family === "anthropic") baseHeaders["Anthropic-Version"] = "2023-06-01";
+  else if (modelInfo.family !== "gemini") baseHeaders["Openai-Version"] = "2020-11-07";
+
+  try {
+    let upstreamBody, upstreamPath;
+    if (modelInfo.family === "anthropic") {
+      upstreamBody = translateOpenAIToAnthropic(chatBody, modelInfo);
+      upstreamPath = modelInfo.path;
+    } else if (modelInfo.family === "gemini") {
+      upstreamBody = translateOpenAIToGoogle(chatBody, modelInfo);
+      upstreamPath = isStream ? modelInfo.streamPath : modelInfo.path;
+    } else {
+      if (chatBody.max_tokens && !chatBody.max_completion_tokens) { chatBody.max_completion_tokens = chatBody.max_tokens; delete chatBody.max_tokens; }
+      if (isStream) chatBody.stream_options = { include_usage: true };
+      upstreamBody = chatBody;
+      upstreamPath = modelInfo.path;
+    }
+
+    const upstreamRes = await tryProxy(upstreamPath, upstreamBody, baseHeaders, modelInfo.tokenName);
+    if (upstreamRes.error) {
+      const errBody = safeParseJson(upstreamRes.body);
+      return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
+    }
+
+    if (isStream) {
+      // Translate chat SSE into Responses-API SSE (response.output_text.delta)
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      const reader = upstreamRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      const emit = o => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(o)}\n\n`); };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith("data: ")) continue;
+          const d = t.slice(6).trim();
+          if (d === "[DONE]") continue;
+          let chunk; try { chunk = JSON.parse(d); } catch { continue; }
+          const delta = chunk.choices?.[0]?.delta;
+          if (delta?.content) {
+            emit({ type: "response.output_text.delta", item_id: `msg_${Date.now()}`, output_index: 0, content_index: 0, delta: delta.content });
+          }
+        }
+      }
+      emit({ type: "response.completed", response: { id: `resp_${Date.now()}`, object: "response", status: "completed" } });
+      if (!res.writableEnded) res.write("data: [DONE]\n\n");
+      if (!res.writableEnded) res.end();
+    } else {
+      let json;
+      if (modelInfo.family === "anthropic") {
+        const an = await upstreamRes.json();
+        json = translateAnthropicResponseToOpenAI(an, modelInfo);
+      } else if (modelInfo.family === "gemini") {
+        json = translateGoogleResponseToOpenAI(await upstreamRes.json(), modelInfo);
+      } else {
+        json = await upstreamRes.json();
+      }
+      res.json(chatToResponsesOutput(json, modelInfo));
+    }
+  } catch (e) {
+    log("error", "Responses error:", e.message);
+    if (!res.headersSent) return res.status(502).json({ error: e.message });
+    res.end();
+  }
+});
+
 app.get("/health", (req, res) => {
+  const breaker = getBreakerState();
   // Check if any tokens are in cooldown
   const tokens = CONFIG.tokens.map(t => {
     const cd = tokenCooldowns.get(t.name);
@@ -216,7 +436,8 @@ app.get("/health", (req, res) => {
   const headers = {};
   if (allExhausted) headers["Retry-After"] = String(Math.min(...tokens.map(t => t.cooldown || 0)) || 30);
   res.set(headers).json({
-    status: allExhausted ? "degraded" : "ok",
+    status: (allExhausted || breaker.open) ? "degraded" : "ok",
+    uptimeSec: Math.round(process.uptime()),
     tokens,
     features: {
       rtk: CONFIG.rtkEnabled,
@@ -225,6 +446,8 @@ app.get("/health", (req, res) => {
       headroom: CONFIG.headroomEnabled,
     },
     ingrazzioUrl: CONFIG.ingrazzioUrl,
+    junie: { userAgent: CONFIG.junieUserAgent, version: CONFIG.junieVersion },
+    circuit: breaker,
   });
 });
 
@@ -247,6 +470,65 @@ async function pipeWebStream(readableStream, res) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Translate Vertex `streamGenerateContent` SSE chunks into OpenAI SSE
+// chat.completion.chunk events (deepseek/openai format the client expects).
+async function pipeGoogleStream(readableStream, res, modelInfo) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let hasSentFinish = false;
+  const STREAM_TIMEOUT = 120_000; // 2min idle timeout
+  let timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+
+  const emit = (obj) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      clearTimeout(timeout);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") break;
+        let chunk;
+        try { chunk = JSON.parse(data); } catch { continue; }
+
+        const cand = (chunk.candidates && chunk.candidates[0]) || null;
+        // Emit text parts that are NOT thought tokens
+        if (cand?.content?.parts) {
+          for (const part of cand.content.parts) {
+            if (part.text && !part.thought) {
+              emit({ choices: [{ index: 0, delta: { content: part.text }, finish_reason: null }] });
+            }
+          }
+        }
+        if (cand?.finishReason) {
+          const fr = cand.finishReason === "STOP" ? "stop" : cand.finishReason === "MAX_TOKENS" ? "length" : null;
+          const um = chunk.promptTokenCount != null || chunk.usageMetadata ? true : false;
+          const usage = um ? { prompt_tokens: chunk.promptTokenCount ?? chunk.usageMetadata?.promptTokenCount ?? 0, completion_tokens: chunk.candidates[0]?.tokenCount ?? 0, total_tokens: (chunk.promptTokenCount ?? 0) + (chunk.candidates[0]?.tokenCount ?? 0) } : null;
+          emit({ choices: [{ index: 0, delta: {}, finish_reason: fr }], usage });
+          hasSentFinish = true;
+        } else if (chunk.usageMetadata && !hasSentFinish) {
+          // Some chunks only carry usage; emit a no-op finish so client knows stream continues
+          emit({ choices: [{ index: 0, delta: {}, finish_reason: null }] });
+        }
+      }
+    }
+  } catch (e) { log("error", "Google SSE:", e.message); }
+  finally { clearTimeout(timeout); }
+
+  if (!hasSentFinish) emit({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: null });
+  if (!res.writableEnded) res.write("data: [DONE]\n\n");
+  if (!res.writableEnded) res.end();
 }
 
 async function pipeAnthropicStream(readableStream, res, modelInfo) {
