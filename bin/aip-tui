@@ -1,5 +1,17 @@
 #!/usr/bin/env node
-import blessed from "blessed";
+/**
+ * aip-tui — AIP Router dashboard (Ink/React rewrite)
+ *
+ * Upgrade dari blessed.js (dead sejak 2016) ke Ink v7 (React untuk CLI,
+ * dipakai Claude Code & Gemini CLI). Tanpa build step: JSX ditulis sebagai
+ * react.createElement(nama, props, ...) sehingga file ini ESM polos.
+ *
+ * Catatan Ink: styling memakai props React (`color`, `bold`, `dimColor`),
+ * BUKAN ANSI escape code literal. Semua teks dibungkus <Text>.
+ */
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { render, Box, Text, useApp, useInput } from "ink";
+import Spinner from "ink-spinner";
 import { spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
@@ -10,176 +22,405 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = join(homedir(), ".aip-router");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 
-let server = null;
-let reqCount = 0;
-let tokensIn = 0;
-let tokensOut = 0;
-let rtkSaved = 0;
-let rtkTotalBytes = 0;
-let healthInterval = null;
-const logEntries = [];
-
-const config = existsSync(CONFIG_PATH)
-  ? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-  : { tokens: [], port: 20129, rtkEnabled: true, cavemanEnabled: false,
-      cavemanLevel: "full", ponytailEnabled: false, headroomEnabled: false, headroomThreshold: 80 };
-
-function saveConfig() {
+// ---- Config helpers ----
+function loadConfig() {
+  const base = existsSync(CONFIG_PATH)
+    ? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
+    : {};
+  return {
+    tokens: base.tokens || [],
+    port: base.port || 20129,
+    rtkEnabled: base.rtkEnabled !== false,
+    cavemanEnabled: base.cavemanEnabled === true,
+    cavemanLevel: base.cavemanLevel || "full",
+    ponytailEnabled: base.ponytailEnabled === true,
+    headroomEnabled: base.headroomEnabled === true,
+    headroomThreshold: base.headroomThreshold || 80,
+    defaultMaxTokens: base.defaultMaxTokens || 2048,
+    rtkTruncate: base.rtkTruncate !== false,
+  };
+}
+function saveConfig(cfg) {
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-// ---- Blessed Setup ----
-const screen = blessed.screen({ smartCSR: true, title: "AIP Router", dockBorders: true, fullUnicode: true });
+// h() = JSX tanpa build step
+const h = React.createElement;
 
-const header = blessed.box({ top: 0, left: 0, width: "100%", height: 1, tags: true,
-  content: ` AIP Router v1.0    {red-fg}●{/red-fg} stopped    http://localhost:${config.port} `,
-  style: { bg: "black", fg: "white" } });
+const HISTORY_MAX = 60;
 
-const configBox = blessed.box({ top: 1, left: 0, width: "40%", bottom: 1, label: " Config ", border: { type: "line" },
-  tags: true, scrollable: true, alwaysScroll: true, style: { border: { fg: "cyan" } } });
-
-const logBox = blessed.box({ top: 1, left: "40%", width: "60%", bottom: 1, label: " Request Log ", border: { type: "line" },
-  tags: true, scrollable: true, alwaysScroll: true, style: { border: { fg: "green" } } });
-
-const footer = blessed.box({ bottom: 0, left: 0, width: "100%", height: 1, tags: true,
-  content: " {bold}s{/bold}Start  {bold}x{/bold}Stop  {bold}1-4{/bold}Toggle  {bold}t{/bold}Token  {bold}p{/bold}Port  {bold}q{/bold}Quit",
-  style: { bg: "black", fg: "white" } });
-
-screen.append(header); screen.append(configBox); screen.append(logBox); screen.append(footer);
-
-// ---- Render ----
-function render() {
-  const lines = [];
-  lines.push("");
-  for (const t of config.tokens) {
-    lines.push(` {bold}${t.name}{/bold}  ${t.token ? "{green-fg}✓{/green-fg}" : "{red-fg}✗{/red-fg}"}`);
-  }
-  lines.push("");
-  lines.push(` Port:  {cyan-fg}${config.port}{/cyan-fg}`);
-  lines.push("");
-  lines.push(` {bold}Features{/bold}`);
-  lines.push(`   ${config.rtkEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} RTK      ${config.rtkEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}`);
-  lines.push(`   ${config.cavemanEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} Caveman  ${config.cavemanEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}  [{yellow-fg}${config.cavemanLevel}{/yellow-fg}]`);
-  lines.push(`   ${config.ponytailEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} Ponytail ${config.ponytailEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}`);
-  lines.push(`   ${config.headroomEnabled ? "{green-fg}●{/green-fg}" : "{#666}○{/#666}"} Headroom ${config.headroomEnabled ? "{green-fg}ON{/green-fg}" : "{#666}OFF{/#666}"}`);
-  lines.push("");
-  lines.push(` {bold}Stats{/bold}`);
-  lines.push(`   Requests:  {cyan-fg}${reqCount}{/cyan-fg}`);
-  lines.push(`   Tokens in: {cyan-fg}${tokensIn.toLocaleString()}{/cyan-fg}`);
-  if (rtkTotalBytes > 0) lines.push(`   RTK saved: {green-fg}${rtkSaved.toLocaleString()}B{/green-fg} (${((rtkSaved/rtkTotalBytes)*100).toFixed(1)}%)`);
-  configBox.setContent(lines.join("\n"));
-  screen.render();
-}
-
-function addLog(text, color = "white") {
-  const t = new Date().toLocaleTimeString();
-  logEntries.push(`  {${color}-fg}${t}{/${color}-fg} ${text}`);
-  if (logEntries.length > 100) logEntries.shift();
-  logBox.setContent(logEntries.join("\n"));
-  logBox.setScrollPerc(100);
-  screen.render();
-}
-
-// ---- Server ----
-function startServer() {
-  if (!config.tokens.some(t => t.token)) { addLog("Set at least one token (press t)", "red"); return; }
-  if (server) { addLog("Already running", "yellow"); return; }
-
-  const tokenStr = config.tokens.map(t => `${t.name}:${t.token}`).join(",");
-  server = spawn(process.execPath, [join(__dirname, "../server.js")], {
-    env: { AIP_TOKENS: tokenStr, PORT: String(config.port),
-      RTK_ENABLED: String(config.rtkEnabled), CAVEMAN_ENABLED: String(config.cavemanEnabled),
-      CAVEMAN_LEVEL: config.cavemanLevel, PONYTAIL_ENABLED: String(config.ponytailEnabled),
-      HEADROOM_ENABLED: String(config.headroomEnabled), HEADROOM_THRESHOLD: String(config.headroomThreshold) },
-    cwd: join(__dirname, ".."), stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  server.stdout.on("data", d => {
-    for (const line of d.toString().trim().split("\n")) {
-      if (!line) continue;
-      if (line.includes("[Token]")) addLog(line.trim(), "cyan");
-      else if (line.includes("[RTK]")) {
-        const m = line.match(/saved (\d+)B.*\(([\d.]+)%\)/);
-        if (m) { rtkSaved += parseInt(m[1]); rtkTotalBytes += parseInt(m[1]) / (parseFloat(m[2]) / 100); }
-        addLog(line.trim(), "green");
-      } else addLog(line.trim(), "white");
+// ---- Sparkline (ASCII block chart, animasi lembut) ----
+function Sparkline({ data, width = 14, height = 3, color = "cyan" }) {
+  const samples = data.slice(-width);
+  if (samples.length < 2) return h(Text, { dimColor: true }, " · menunggu ·");
+  const max = Math.max(...samples.map(s => s.value), 1);
+  const rows = [];
+  for (let r = 0; r < height; r++) {
+    let line = "";
+    for (let c = 0; c < width; c++) {
+      const idx = Math.max(0, samples.length - width + c);
+      const hgt = Math.max(1, Math.round((samples[idx].value / max) * height));
+      line += r < hgt ? "\u2588" : " ";
     }
-  });
-
-  server.stderr.on("data", d => {
-    const text = d.toString().trim();
-    if (!text) return;
-    addLog(text, "red");
-    const log = existsSync(join(CONFIG_DIR, "server.log")) ? readFileSync(join(CONFIG_DIR, "server.log"), "utf8") : "";
-    writeFileSync(join(CONFIG_DIR, "server.log"), log + text + "\n");
-  });
-
-  server.on("exit", code => {
-    server = null;
-    header.setContent(` AIP Router v1.0    ${code === 0 ? "{green-fg}●{/green-fg}" : "{red-fg}●{/red-fg}"} ${code === 0 ? "stopped" : `crashed (${code})`}    http://localhost:${config.port} `);
-    addLog(`Server ${code === 0 ? "stopped" : `exited (${code})`}`, code === 0 ? "green" : "red");
-    if (healthInterval) { clearInterval(healthInterval); healthInterval = null; }
-    screen.render();
-  });
-
-  server.on("spawn", () => {
-    header.setContent(` AIP Router v1.0    {green-fg}●{/green-fg} running    http://localhost:${config.port} `);
-    addLog("Server started", "green");
-    screen.render();
-    healthInterval = setInterval(pollHealth, 3000);
-  });
+    rows.push(h(Text, { key: r, color }, line));
+  }
+  return h(Box, { flexDirection: "column" }, rows);
 }
 
-function stopServer() {
-  if (!server) { addLog("Not running", "yellow"); return; }
-  server.kill("SIGTERM"); server = null;
-  if (healthInterval) { clearInterval(healthInterval); healthInterval = null; }
-  header.setContent(` AIP Router v1.0    {red-fg}●{/red-fg} stopped    http://localhost:${config.port} `);
-  addLog("Stopping...", "yellow"); screen.render();
+// ---- Small presentational atoms ----
+function Dot({ on }) {
+  return h(Text, { color: on ? "green" : "gray" }, on ? "●" : "○");
+}
+function ToggleRow({ label, on, detail, color = "green" }) {
+  return h(Box, {},
+    h(Dot, { on }),
+    h(Text, { dimColor: true }, ` ${label.padEnd(9)}`),
+    h(Text, { bold: true, color: on ? color : "gray" }, on ? "ON" : "OFF"),
+    detail ? h(Text, { dimColor: true }, `  ${detail}`) : null
+  );
+}
+function StatusLine({ label, value, color }) {
+  return h(Box, {},
+    h(Text, { color: "cyan", bold: true }, ` ${label}: `),
+    h(Text, { color: color || "white" }, String(value))
+  );
 }
 
-async function pollHealth() {
-  try { await fetch(`http://localhost:${config.port}/health`); } catch {}
+// ---- Main App ----
+function App() {
+  const { exit } = useApp();
+
+  const [cfg, setCfg] = useState(loadConfig);
+  const [running, setRunning] = useState(false);
+  const [spawning, setSpawning] = useState(false);
+  const [health, setHealth] = useState(null);
+  const [logs, setLogs] = useState([]);
+  const [reqCount, setReqCount] = useState(0);
+  const [tokensIn, setTokensIn] = useState(0);
+  const [tokensOut, setTokensOut] = useState(0);
+  const [rtkSaved, setRtkSaved] = useState(0);
+  const [rtkTotal, setRtkTotal] = useState(0);
+  const [hist, setHist] = useState([]);
+  const [modal, setModal] = useState(null);
+  const [flash, setFlash] = useState(null);
+
+  const serverRef = useRef(null);
+  const healthTimerRef = useRef(null);
+  const flashTimerRef = useRef(null);
+  const logSeq = useRef(0);
+  const logStack = useRef([]);
+  const inputBuf = useRef("");
+
+  // ---- helpers ----
+  const setFlashMsg = useCallback(msg => {
+    setFlash(msg);
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = setTimeout(() => setFlash(null), 4000);
+  }, []);
+
+  const addLog = useCallback((text, color = "white") => {
+    const e = { id: ++logSeq.current, time: new Date().toLocaleTimeString(), text, color };
+    logStack.current.push(e);
+    if (logStack.current.length > 80) logStack.current.shift();
+    setLogs([...logStack.current]);
+  }, []);
+
+  const updateCfg = useCallback(updater => {
+    setCfg(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      saveConfig(next);
+      return next;
+    });
+  }, []);
+
+  // ---- Server lifecycle ----
+  const pollHealth = useCallback(() => {
+    fetch(`http://localhost:${cfg.port}/health`)
+      .then(r => { if (r.ok) return r.json(); return null; })
+      .then(d => {
+        if (!d) return null;
+        setHealth(d);
+        // Server-side usage counters are authoritative (no regex on logs)
+        if (d.usage) {
+          setReqCount(d.usage.requests);
+          setTokensIn(d.usage.tokensIn);
+          setTokensOut(d.usage.tokensOut);
+          if (d.usage.rtkSavedBytes > 0) setRtkSaved(d.usage.rtkSavedBytes);
+        }
+        return d;
+      })
+      .catch(() => {});
+  }, [cfg.port]);
+
+  const startServer = useCallback(() => {
+    if (serverRef.current) { setFlashMsg("Sudah running"); return; }
+    if (!cfg.tokens.some(t => t.token)) { setFlashMsg("Set token dulu (t)"); return; }
+    const tokenStr = cfg.tokens.map(t => `${t.name}:${t.token}`).join(",");
+    setSpawning(true);
+    const child = spawn(process.execPath, [join(__dirname, "../server.js")], {
+      env: {
+        ...process.env,
+        AIP_TOKENS: tokenStr, PORT: String(cfg.port),
+        RTK_ENABLED: String(cfg.rtkEnabled), RTK_TRUNCATE: String(cfg.rtkTruncate),
+        CAVEMAN_ENABLED: String(cfg.cavemanEnabled), CAVEMAN_LEVEL: cfg.cavemanLevel,
+        PONYTAIL_ENABLED: String(cfg.ponytailEnabled), HEADROOM_ENABLED: String(cfg.headroomEnabled),
+        HEADROOM_THRESHOLD: String(cfg.headroomThreshold), DEFAULT_MAX_TOKENS: String(cfg.defaultMaxTokens),
+      },
+      cwd: join(__dirname, ".."), stdio: ["ignore", "pipe", "pipe"],
+    });
+    serverRef.current = child;
+
+    child.stdout.on("data", d => {
+      for (const line of d.toString().trim().split("\n")) {
+        if (!line) continue;
+        if (line.includes("[Token]")) addLog(line.trim(), "cyan");
+        else if (line.includes("[RTK]")) {
+          const m = line.match(/saved (\d+)B.*\(([\d.]+)%\)/);
+          const saved = m ? parseInt(m[1], 10) : 0;
+          if (saved > 0) {
+            setRtkSaved(v => v + saved);
+            setRtkTotal(v => v + saved / (parseFloat(m[2]) / 100));
+          }
+          addLog(line.trim(), "green");
+        }
+        // [req]/[request]/[done] — just display the line; counters now come
+        // from /health usage (server-side accumulator), not regex on logs.
+        else if (line.includes("[req]") || line.includes("[request]") || line.includes("[done]")) {
+          addLog(line.trim(), "white");
+        } else addLog(line.trim(), "white");
+      }
+    });
+    child.stderr.on("data", d => {
+      const text = d.toString().trim();
+      if (!text) return;
+      addLog(text, "red");
+      const f = join(CONFIG_DIR, "server.log");
+      writeFileSync(f, (existsSync(f) ? readFileSync(f, "utf8") : "") + text + "\n");
+    });
+    child.on("spawn", () => {
+      setRunning(true); setSpawning(false);
+      addLog("Server started", "green");
+      setFlashMsg(`Server berjalan di :${cfg.port}`);
+      healthTimerRef.current = setInterval(pollHealth, 2500);
+    });
+    child.on("exit", code => {
+      serverRef.current = null;
+      setRunning(false); setSpawning(false);
+      if (healthTimerRef.current) { clearInterval(healthTimerRef.current); healthTimerRef.current = null; }
+      addLog(`Server ${code === 0 ? "stopped" : `exited (${code})`}`, code === 0 ? "green" : "red");
+      setFlashMsg(code === 0 ? "Server stopped" : `Server crash (${code})`);
+    });
+  }, [cfg, pollHealth, addLog, setFlashMsg]);
+
+  const stopServer = useCallback(() => {
+    if (!serverRef.current) { setFlashMsg("Tidak running"); return; }
+    serverRef.current.kill("SIGTERM");
+    addLog("Stopping…", "yellow");
+  }, [addLog, setFlashMsg]);
+
+  // Update history when token counters change
+  useEffect(() => {
+    setHist(prev => {
+      if (prev.length === 0) return prev.concat({ t: Date.now(), in: tokensIn, out: tokensOut });
+      const last = prev[prev.length - 1];
+      if (last.in === tokensIn && last.out === tokensOut) return prev;
+      const minusLast = prev.slice(0, -1);
+      return minusLast.concat({ t: Date.now(), in: tokensIn, out: tokensOut }).slice(-HISTORY_MAX);
+    });
+  }, [tokensIn, tokensOut]);
+
+  // Auto-start server pada mount jika token sudah dikonfigurasi
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    if (autoStarted.current) return;
+    if (cfg.tokens.some(t => t.token)) {
+      autoStarted.current = true;
+      // delay kecil biar output pertama dirender dulu
+      const id = setTimeout(startServer, 600);
+      return () => clearTimeout(id);
+    }
+  }, [cfg, startServer]);
+
+  // cleanup
+  useEffect(() => () => {
+    if (serverRef.current) serverRef.current.kill("SIGTERM");
+    if (healthTimerRef.current) clearInterval(healthTimerRef.current);
+  }, []);
+
+  // ---- Keyboard (useInput gantikan stdin raw) ----
+  useInput((input, key) => {
+    if (key.ctrlC || key.escape) { exit(); return; }
+    if (key.return) {
+      const val = inputBuf.current.trim();
+      if (modal?.type === "token") {
+        if (val) {
+          const name = modal.name;
+          updateCfg(c => {
+            const i = c.tokens.findIndex(t => t.name === name);
+            const clone = { ...c, tokens: c.tokens.map(t => ({ ...t })) };
+            const idx = clone.tokens.findIndex(t => t.name === name);
+            if (idx >= 0) clone.tokens[idx].token = val;
+            else clone.tokens.push({ name, token: val });
+            return clone;
+          });
+          setFlashMsg(`Token "${name}" ${val ? "diset" : "dikosongkan"}`);
+        }
+      } else if (modal?.type === "port") {
+        const n = parseInt(val, 10);
+        if (n > 0) { updateCfg(c => ({ ...c, port: n })); setFlashMsg(`Port → ${n}`); }
+        else setFlashMsg("Port tidak valid");
+      } else if (modal?.type === "caveman") {
+        if (["lite", "full", "ultra"].includes(val)) { updateCfg(c => ({ ...c, cavemanLevel: val })); setFlashMsg(`Caveman → ${val}`); }
+        else setFlashMsg("Level: lite/full/ultra");
+      } else if (modal?.type === "maxtok") {
+        const n = parseInt(val, 10);
+        if (n > 0) { updateCfg(c => ({ ...c, defaultMaxTokens: n })); setFlashMsg(`max_tokens → ${n}`); }
+        else setFlashMsg("Angka tidak valid");
+      }
+      inputBuf.current = "";
+      setModal(null);
+      return;
+    }
+    if (modal) {
+      if (key.delete || key.backspace) inputBuf.current = inputBuf.current.slice(0, -1);
+      else if (input && !key.ctrl) inputBuf.current += input;
+      return;
+    }
+    // global keys
+    if (input === "s" || input === "S") startServer();
+    else if (input === "x" || input === "X") stopServer();
+    else if (input === "t") { inputBuf.current = ""; setModal({ type: "token", name: "aip" }); }
+    else if (input === "p") { inputBuf.current = ""; setModal({ type: "port" }); }
+    else if (input === "c") { inputBuf.current = ""; setModal({ type: "caveman" }); }
+    else if (input === "m") { inputBuf.current = ""; setModal({ type: "maxtok" }); }
+    else if (input === "1") updateCfg(c => ({ ...c, rtkEnabled: !c.rtkEnabled }));
+    else if (input === "2") updateCfg(c => ({ ...c, cavemanEnabled: !c.cavemanEnabled }));
+    else if (input === "3") updateCfg(c => ({ ...c, ponytailEnabled: !c.ponytailEnabled }));
+    else if (input === "4") updateCfg(c => ({ ...c, headroomEnabled: !c.headroomEnabled }));
+    else if (input === "r") updateCfg(c => ({ ...c, rtkTruncate: !c.rtkTruncate }));
+  }, { isActive: true });
+
+  // ---- derived ----
+  const breaker = health?.circuit;
+  const hasToken = cfg.tokens.some(t => t.token);
+  const statusColor = !running ? (spawning ? "yellow" : "gray")
+    : breaker?.open ? "red" : health?.status === "degraded" ? "yellow" : "green";
+  const statusWord = !running ? (spawning ? "spawning" : "stopped")
+    : breaker?.open ? "CIRCUIT OPEN" : health?.status ?? "starting";
+
+  const uptimeMin = health?.uptimeSec != null ? Math.round(health.uptimeSec / 60) : null;
+  const junieV = health?.junie?.version;
+
+  const sparkIn = hist.map(p => ({ value: p.in }));
+  const sparkOut = hist.map(p => ({ value: p.out }));
+
+  const rtkPct = rtkTotal > 0 ? ((rtkSaved / rtkTotal) * 100).toFixed(1) : null;
+
+  // ---- render ----
+  return h(Box, { flexDirection: "column", width: "100%" },
+    // Header
+    h(Box, { height: 1, borderStyle: "round", borderColor: statusColor, paddingLeft: 1 },
+      h(Text, { color: statusColor, bold: true }, " aip-router "),
+      h(Text, {}, ` ${statusWord} `),
+      h(Text, { dimColor: true }, `:${cfg.port}   up:${uptimeMin != null ? uptimeMin + "m" : "—"}   junie:${junieV || "?"}   tok:${cfg.tokens.filter(t => t.token).length}/${cfg.tokens.length}`)
+    ),
+
+    // Body (3 kolom)
+    h(Box, { flexDirection: "row", width: "100%", height: 17, borderStyle: "round", borderColor: "gray" },
+
+      // Kolom kiri — Status + Features
+      h(Box, { flexDirection: "column", width: "40%", paddingLeft: 1, paddingTop: 1 },
+        h(Text, { bold: true, color: "cyan" }, " Status"),
+        h(Box, {}, h(Text, { dimColor: true }, "  Request:"), h(Text, { color: "yellow" }, ` ${reqCount}`)),
+        h(Box, {}, h(Text, { dimColor: true }, "  Tokens in:"), h(Text, { color: "cyan" }, ` ${tokensIn.toLocaleString()}`)),
+        h(Box, {}, h(Text, { dimColor: true }, "  Tokens out:"), h(Text, { color: "cyan" }, ` ${tokensOut.toLocaleString()}`)),
+        h(Box, {}, h(Text, { dimColor: true }, "  RTK saved:"), h(Text, { color: "green" }, ` ${rtkSaved.toLocaleString()}B${rtkPct ? ` (${rtkPct}%)` : ""}`)),
+        breaker && h(Box, {},
+          h(Text, { dimColor: true }, "  Circuit:"),
+          h(Text, { bold: true, color: breaker.open ? "red" : "green" }, breaker.open ? " OPEN" : " closed"),
+          h(Text, { dimColor: true }, ` fail=${breaker.failures}/5 req=${breaker.totalRequests}${breaker.reopenInMs ? ` reopen:${Math.round(breaker.reopenInMs / 1000)}s` : ""}`)
+        ),
+        h(Box, {}, h(Text, { dimColor: true }, "  Health:"), h(Text, { color: health?.status === "degraded" ? "yellow" : "green" }, ` ${health?.status ?? "n/a"}`)),
+
+        h(Text, {}, " "),
+        h(Text, { bold: true, color: "cyan" }, " Features"),
+        h(ToggleRow, { label: "rtk", on: cfg.rtkEnabled }),
+        h(ToggleRow, { label: "rtkTrunc", on: cfg.rtkTruncate }),
+        h(ToggleRow, { label: "caveman", on: cfg.cavemanEnabled, detail: cfg.cavemanEnabled ? `[${cfg.cavemanLevel}]` : null, color: "magenta" }),
+        h(ToggleRow, { label: "ponytail", on: cfg.ponytailEnabled }),
+        h(ToggleRow, { label: "headroom", on: cfg.headroomEnabled, detail: cfg.headroomEnabled ? `[${cfg.headroomThreshold}%]` : null }),
+        h(Box, {}, h(Text, { dimColor: true }, "  max_tok:"), h(Text, { color: "cyan" }, ` ${cfg.defaultMaxTokens}`))
+      ),
+
+      // Kolom tengah — Tokens + Chart
+      h(Box, { flexDirection: "column", width: "30%", paddingLeft: 1, paddingTop: 1 },
+        h(Text, { bold: true, color: "cyan" }, " Tokens"),
+        cfg.tokens.length === 0
+          ? h(Text, { dimColor: true }, "  (kosong — tekan t)")
+          : cfg.tokens.map(t => {
+              const cool = health?.tokens?.find(tk => tk.name === t.name)?.cooldown || 0;
+              const state = !t.token
+                ? h(Text, { color: "red" }, " ✗ kosong")
+                : cool > 0
+                  ? h(Text, { color: "yellow" }, ` ⧗ cooldown ${(cool / 1000).toFixed(0)}s`)
+                  : h(Text, { color: "green" }, " ✓ active");
+              return h(Box, { key: t.name }, h(Text, {}, `  ${t.name}`), state);
+            }),
+
+        h(Text, {}, " "),
+        h(Text, { bold: true, color: "cyan" }, " Token usage / 1m"),
+        h(Box, { flexDirection: "row" },
+          h(Box, { flexDirection: "column", width: "50%" },
+            h(Text, { dimColor: true }, " in"),
+            h(Sparkline, { data: sparkIn, color: "cyan" })
+          ),
+          h(Box, { flexDirection: "column", width: "50%" },
+            h(Text, { dimColor: true }, " out"),
+            h(Sparkline, { data: sparkOut, color: "green" })
+          )
+        )
+      ),
+
+      // Kolom kanan — Log
+      h(Box, { flexDirection: "column", width: "30%", paddingLeft: 1, paddingTop: 1 },
+        h(Text, { bold: true, color: "cyan" }, " Request Log"),
+        logs.length === 0
+          ? h(Text, { dimColor: true }, "  (kosong)")
+          : logs.slice(-38).map(l => h(Text, { key: l.id, color: l.color }, ` ${l.time} ${l.text}`))
+      )
+    ),
+
+    // Modal editor
+    modal && h(Box, { borderStyle: "double", borderColor: "magenta", paddingLeft: 1, height: 3, flexDirection: "column", justifyContent: "center" },
+      h(Text, { bold: true }, ` ${modalPrompt(modal)} `),
+      h(Text, { color: "cyan" }, `  ${inputBuf.current}█`)
+    ),
+
+    // Status/flash line
+    h(Box, { height: 1, paddingLeft: 1 },
+      flash
+        ? h(Text, { color: "yellow", bold: true }, ` ${flash}`)
+        : spawning
+          ? h(Box, {}, h(Spinner, { type: "dots" }), h(Text, { dimColor: true }, " menerbitkan server…"))
+          : h(Text, { dimColor: true }, "")
+    ),
+
+    // Footer keymap
+    h(Box, { paddingLeft: 1, borderStyle: "round", borderColor: "gray" },
+      h(Text, { dimColor: true },
+        ` s start   x stop   1 rtk   2 caveman   3 ponytail   4 headroom   r trunc   t token   p port   c caveman   m maxtok   q/esc quit`)
+    )
+  );
 }
 
-// ---- Input ----
-function promptInput(question, callback) {
-  const prompt = blessed.prompt({ parent: screen, border: "line", height: 5, width: "60%",
-    top: "center", left: "center", label: ` ${question} `, tags: true,
-    style: { border: { fg: "cyan" }, bg: "black", fg: "white" } });
-  prompt.input("", "", (err, value) => { prompt.destroy(); screen.render(); if (value) callback(value.trim()); });
+function modalPrompt(m) {
+  if (m.type === "token") return `Token untuk "${m.name}" →`;
+  if (m.type === "port") return "Port baru →";
+  if (m.type === "caveman") return "Caveman level (lite/full/ultra) →";
+  if (m.type === "maxtok") return "Default max_tokens (2048) →";
+  return "→";
 }
 
-function addToken(name) {
-  promptInput(`Token for "${name}" (perm-...)`, val => {
-    const existing = config.tokens.findIndex(t => t.name === name);
-    if (existing >= 0) config.tokens[existing].token = val;
-    else config.tokens.push({ name, token: val });
-    saveConfig(); render(); addLog(`Token "${name}" ${val ? "set" : "cleared"}`, "green");
-  });
-}
-
-screen.key(["1"], () => { config.rtkEnabled = !config.rtkEnabled; saveConfig(); render(); });
-screen.key(["2"], () => { config.cavemanEnabled = !config.cavemanEnabled; saveConfig(); render(); });
-screen.key(["3"], () => { config.ponytailEnabled = !config.ponytailEnabled; saveConfig(); render(); });
-screen.key(["4"], () => { config.headroomEnabled = !config.headroomEnabled; saveConfig(); render(); });
-screen.key(["s", "S"], startServer);
-screen.key(["x", "X"], stopServer);
-screen.key(["t", "T"], () => promptInput("Token name (e.g. aip, junp):", addToken));
-screen.key(["p", "P"], () => {
-  promptInput("Port", val => { const n = parseInt(val); if (n > 0) { config.port = n; saveConfig(); render(); } });
-});
-screen.key(["c", "C"], () => {
-  promptInput("Caveman level (lite/full/ultra)", val => {
-    if (["lite","full","ultra"].includes(val)) { config.cavemanLevel = val; saveConfig(); render(); }
-  });
-});
-screen.key(["q", "Q"], () => { stopServer(); process.exit(0); });
-screen.key(["escape"], () => process.exit(0));
-
-screen.render(); render();
-addLog("Ready. Press t to add tokens, s to start", "cyan");
-
-// Auto-start if tokens configured
-if (config.tokens.some(t => t.token)) setTimeout(startServer, 500);
+// ---- Auto-start jika token sudah dikonfig & server belum jalan ----
+render(h(App), { exitOnCtrlC: false });
