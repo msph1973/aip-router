@@ -138,7 +138,18 @@ function App() {
   const pollHealth = useCallback(() => {
     fetch(`http://localhost:${cfg.port}/health`)
       .then(r => { if (r.ok) return r.json(); return null; })
-      .then(d => { if (d) setHealth(d); })
+      .then(d => {
+        if (!d) return null;
+        setHealth(d);
+        // Server-side usage counters are authoritative (no regex on logs)
+        if (d.usage) {
+          setReqCount(d.usage.requests);
+          setTokensIn(d.usage.tokensIn);
+          setTokensOut(d.usage.tokensOut);
+          if (d.usage.rtkSavedBytes > 0) setRtkSaved(d.usage.rtkSavedBytes);
+        }
+        return d;
+      })
       .catch(() => {});
   }, [cfg.port]);
 
@@ -173,13 +184,9 @@ function App() {
           }
           addLog(line.trim(), "green");
         }
-        // [req] lines carry "in=.. out=.." token counts
+        // [req]/[request]/[done] — just display the line; counters now come
+        // from /health usage (server-side accumulator), not regex on logs.
         else if (line.includes("[req]") || line.includes("[request]") || line.includes("[done]")) {
-          setReqCount(c => c + 1);
-          const im = line.match(/in\s*[=\s](\d+)/i) || line.match(/prompt[_ ]?tokens[=\s](\d+)/i);
-          const om = line.match(/out\s*[=\s](\d+)/i) || line.match(/completion[_ ]?tokens[=\s](\d+)/i);
-          if (im) setTokensIn(v => v + parseInt(im[1], 10));
-          if (om) setTokensOut(v => v + parseInt(om[1], 10));
           addLog(line.trim(), "white");
         } else addLog(line.trim(), "white");
       }

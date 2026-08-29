@@ -38,6 +38,16 @@ app.use((req, res, next) => {
 const tokenCooldowns = new Map();
 const COOLDOWN_MS = 30_000; // 30 seconds
 
+// Accumulated usage counters — surfaced via /health so the TUI can show live
+// token in/out without regex-parsing stdout logs.
+const STATS = { requests: 0, tokensIn: 0, tokensOut: 0, rtkSavedBytes: 0 };
+function trackUsage(usage) {
+  if (!usage) return;
+  const pin = t => (typeof t === "number" && isFinite(t) && t > 0) ? Math.round(t) : 0;
+  STATS.tokensIn += pin(usage.prompt_tokens ?? usage.input_tokens);
+  STATS.tokensOut += pin(usage.completion_tokens ?? usage.output_tokens);
+}
+
 function detectModelFamily(model) {
   if (!model) return "openai";
   // Use the part after the last "/" for detection (handles "aip/claude-sonnet-4-6")
@@ -220,7 +230,9 @@ app.all("/v1/chat/completions", async (req, res) => {
         await pipeAnthropicStream(upstreamRes.body, res, modelInfo);
       } else {
         const json = await upstreamRes.json();
-        res.json(translateAnthropicResponseToOpenAI(json, modelInfo));
+        const out = translateAnthropicResponseToOpenAI(json, modelInfo);
+        trackUsage(out.usage);
+        res.json(out);
       }
     } else if (modelInfo.family === "gemini") {
       const gBody = translateOpenAIToGoogle(body, modelInfo);
@@ -238,7 +250,9 @@ app.all("/v1/chat/completions", async (req, res) => {
         await pipeGoogleStream(upstreamRes.body, res, modelInfo);
       } else {
         const json = await upstreamRes.json();
-        res.json(translateGoogleResponseToOpenAI(json, modelInfo));
+        const out = translateGoogleResponseToOpenAI(json, modelInfo);
+        trackUsage(out.usage);
+        res.json(out);
       }
     } else {
       if (body.max_tokens && !body.max_completion_tokens) {
@@ -257,9 +271,12 @@ app.all("/v1/chat/completions", async (req, res) => {
         res.setHeader("Connection", "keep-alive");
         await pipeWebStream(upstreamRes.body, res);
       } else {
-        res.json(await upstreamRes.json());
+        const json = await upstreamRes.json();
+        trackUsage(json.usage);
+        res.json(json);
       }
     }
+    STATS.requests++;
   } catch (e) {
     log("error", "Router error:", e.message);
     if (!res.headersSent) return res.status(502).json({ error: e.message });
@@ -422,8 +439,10 @@ app.all("/v1/responses", async (req, res) => {
       } else {
         json = await upstreamRes.json();
       }
+      trackUsage(json.usage);
       res.json(chatToResponsesOutput(json, modelInfo));
     }
+    STATS.requests++;
   } catch (e) {
     log("error", "Responses error:", e.message);
     if (!res.headersSent) return res.status(502).json({ error: e.message });
@@ -456,20 +475,42 @@ app.get("/health", (req, res) => {
     ingrazzioUrl: CONFIG.ingrazzioUrl,
     junie: { userAgent: CONFIG.junieUserAgent, version: CONFIG.junieVersion },
     circuit: breaker,
+    usage: { requests: STATS.requests, tokensIn: STATS.tokensIn, tokensOut: STATS.tokensOut, rtkSavedBytes: STATS.rtkSavedBytes },
   });
 });
 
 async function pipeWebStream(readableStream, res) {
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();
+  let buffer = "";
   const STREAM_TIMEOUT = 120_000; // 2min idle timeout
   let timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+  // Hidden usage spy — passes bytes through unchanged, but peeks at `data:` SSE
+  // lines so streamed deepseek/openai usage can be accumulated (include_usage).
+  function peekSse(flush) {
+    buffer += flush;
+    let idx;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, idx); buffer = buffer.slice(idx + 1);
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        const obj = JSON.parse(payload);
+        // usage-bearing finish chunk (stream_options.include_usage) or any chunk w/ usage
+        if (obj.usage || obj.choices?.[0]?.finish_reason) trackUsage(obj.usage);
+      } catch { /* not JSON — ignore */ }
+    }
+  }
   try {
     while (true) {
       const { done, value } = await reader.read();
       clearTimeout(timeout);
       if (done) { res.end(); return; }
-      res.write(decoder.decode(value, { stream: true }));
+      const str = decoder.decode(value, { stream: true });
+      res.write(str);
+      peekSse(str);
       timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
     }
   } catch (e) {
@@ -524,10 +565,12 @@ async function pipeGoogleStream(readableStream, res, modelInfo) {
           const um = chunk.promptTokenCount != null || chunk.usageMetadata ? true : false;
           const usage = um ? { prompt_tokens: chunk.promptTokenCount ?? chunk.usageMetadata?.promptTokenCount ?? 0, completion_tokens: chunk.candidates[0]?.tokenCount ?? 0, total_tokens: (chunk.promptTokenCount ?? 0) + (chunk.candidates[0]?.tokenCount ?? 0) } : null;
           emit({ choices: [{ index: 0, delta: {}, finish_reason: fr }], usage });
+          if (usage) trackUsage(usage);
           hasSentFinish = true;
         } else if (chunk.usageMetadata && !hasSentFinish) {
           // Some chunks only carry usage; emit a no-op finish so client knows stream continues
           emit({ choices: [{ index: 0, delta: {}, finish_reason: null }] });
+          trackUsage({ prompt_tokens: chunk.usageMetadata?.promptTokenCount ?? 0, completion_tokens: chunk.usageMetadata?.candidatesTokenCount ?? chunk.candidates?.[0]?.tokenCount ?? 0 });
         }
       }
     }
@@ -591,6 +634,7 @@ async function pipeAnthropicStream(readableStream, res, modelInfo) {
             { const fr = event.delta?.stop_reason === "end_turn" ? "stop" : event.delta?.stop_reason === "max_tokens" ? "length" : event.delta?.stop_reason === "tool_use" ? "tool_calls" : null;
             const usage = event.usage ? { prompt_tokens: event.usage.input_tokens || 0, completion_tokens: event.usage.output_tokens || 0, total_tokens: (event.usage.input_tokens || 0) + (event.usage.output_tokens || 0) } : null;
             res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: fr }], usage })}\n\n`);
+            if (usage) trackUsage(usage);
             hasSentFinish = true; }
             break;
           case "message_stop":
