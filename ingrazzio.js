@@ -97,7 +97,7 @@ export async function proxyToIngrazzio(path, body, headers, retries = 3) {
 export function translateOpenAIToAnthropic(body, modelInfo) {
   const anBody = {
     model: body.model,
-    max_tokens: body.max_tokens || 8192,
+    max_tokens: body.max_tokens || 2048,
     stream: body.stream === true,
   };
   if (body.temperature !== undefined) anBody.temperature = body.temperature;

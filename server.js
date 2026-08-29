@@ -98,8 +98,14 @@ function getToken(name) {
 }
 
 function applyTokenSavers(body) {
+  // Bounded default max output tokens — prevents runaway responses when the
+  // client doesn't set a limit. Applies to every family (deepseek passthrough,
+  // gemini translator, anthropic translator all read body.max_tokens).
+  if (!body.max_tokens && !body.max_completion_tokens && !body.max_output_tokens) {
+    body.max_tokens = CONFIG.defaultMaxTokens;
+  }
   if (CONFIG.rtkEnabled) {
-    const stats = compressMessages(body);
+    const stats = compressMessages(body, { truncate: CONFIG.rtkTruncate });
     const msg = formatRtkLog(stats);
     if (msg) log("rtk", msg);
   }
@@ -441,6 +447,8 @@ app.get("/health", (req, res) => {
     tokens,
     features: {
       rtk: CONFIG.rtkEnabled,
+      rtkTruncate: CONFIG.rtkTruncate,
+      defaultMaxTokens: CONFIG.defaultMaxTokens,
       caveman: CONFIG.cavemanEnabled ? CONFIG.cavemanLevel : false,
       ponytail: CONFIG.ponytailEnabled,
       headroom: CONFIG.headroomEnabled,
