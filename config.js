@@ -27,10 +27,22 @@ export const CONFIG = {
 
   tokens: getTokens(),
 
+  // Junie identity headers — capture from a real Junie CLI run, not hardcoded,
+  // so they can be bumped without code edits when JetBrains ships a new version.
+  junieUserAgent: process.env.JUNIE_UA || "junie-cli:26.8.31-eap",
+  junieVersion: process.env.JUNIE_VERSION || "3013.2",
+
   rtkEnabled: process.env.RTK_ENABLED !== "false",
+  rtkTruncate: process.env.RTK_TRUNCATE !== "false",
   cavemanEnabled: process.env.CAVEMAN_ENABLED === "true",
   cavemanLevel: process.env.CAVEMAN_LEVEL || "full",
   ponytailEnabled: process.env.PONYTAIL_ENABLED === "true",
   headroomEnabled: process.env.HEADROOM_ENABLED === "true",
   headroomThreshold: parseInt(process.env.HEADROOM_THRESHOLD || "80", 10),
+
+  // Default max output tokens when the client doesn't set one. 8192 is the
+  // previous Anthropic default — generous but wasteful for agents that don't
+  // care how long the reply is. 2048 is a sane floor that still covers most
+  // real answers while bounding runaway responses.
+  defaultMaxTokens: parseInt(process.env.DEFAULT_MAX_TOKENS || "2048", 10),
 };
