@@ -204,6 +204,19 @@ function getToken(name) {
 }
 
 function applyTokenSavers(body) {
+  // C2: normalize max-tokens aliases so every family translator sees the same
+  // field. SDKs disagree on the name: max_tokens (classic OpenAI), max_completion_tokens
+  // (newer OpenAI SDKs), max_output_tokens (Responses API). Reconcile all three
+  // into a single body.max_tokens BEFORE the translators run — otherwise
+  // translateOpenAIToAnthropic (ingrazzio:228) and translateOpenAIToGoogle
+  // (ingrazzio:358) only read body.max_tokens and silently ignore the alias.
+  {
+    const mt = body.max_tokens ?? body.max_completion_tokens ?? body.max_output_tokens;
+    if (mt !== undefined && mt !== null && body.max_tokens === undefined) {
+      const n = typeof mt === "number" ? mt : parseInt(String(mt), 10);
+      body.max_tokens = Number.isFinite(n) ? n : CONFIG.defaultMaxTokens;
+    }
+  }
   // Bounded default max output tokens — prevents runaway responses when the
   // client doesn't set a limit. Applies to every family (deepseek passthrough,
   // gemini translator, anthropic translator all read body.max_tokens).
