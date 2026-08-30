@@ -242,8 +242,14 @@ async function tryProxy(path, body, headers, tokenName) {
       const res = await proxyToIngrazzio(path, body, h);
       if (res.error) {
         if (res.status === 401 || res.status === 429 || res.status === 403) {
-          if (res.status === 429) tokenCooldowns.set(name, Date.now() + COOLDOWN_MS);
-          log("token", `${name} ${res.status}, trying next...`);
+          if (res.status === 429) {
+            // Use provider-suggested retry-after if given, else the default 30s.
+            const ra = res.retryAfterMs || COOLDOWN_MS;
+            tokenCooldowns.set(name, Date.now() + ra);
+            log("token", `${name} 429, cooling ${Math.round(ra / 1000)}s (retry-after: ${res.retryAfterMs || "default"})`);
+          } else {
+            log("token", `${name} ${res.status}, trying next...`);
+          }
           continue;
         }
         return res;
