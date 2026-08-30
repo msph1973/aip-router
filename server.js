@@ -627,6 +627,28 @@ app.get("/health", (req, res) => {
   });
 });
 
+// OpenAI-standard model discovery (GET /v1/models). Metadata only — never
+// forwarded upstream. Lets omp/yaak/junie enumerate the supported models
+// instead of hitting 404 or falling back to hardcoded lists.
+app.get("/v1/models", (req, res) => {
+  res.json({
+    object: "list",
+    data: CONFIG.models.map(id => ({
+      id,
+      object: "model",
+      created: 0,
+      owned_by: "aip-router",
+    })),
+  });
+});
+
+app.get("/v1/models/:id", (req, res) => {
+  const id = req.params.id;
+  const found = CONFIG.models.find(m => m === id);
+  if (!found) return res.status(404).json({ error: `model '${id}' not found`, object: "error" });
+  res.json({ id: found, object: "model", created: 0, owned_by: "aip-router" });
+});
+
 async function pipeWebStream(readableStream, res) {
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();

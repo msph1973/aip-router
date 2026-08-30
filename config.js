@@ -45,4 +45,9 @@ export const CONFIG = {
   // care how long the reply is. 2048 is a sane floor that still covers most
   // real answers while bounding runaway responses.
   defaultMaxTokens: parseInt(process.env.DEFAULT_MAX_TOKENS || "2048", 10),
+
+  // Models advertised by GET /v1/models (for omp/yaak/junie model discovery).
+  // Only these three are supported/expected to work through the router.
+  models: (process.env.AIP_MODELS || "deepseek-v4-flash,gemini-3.7-flash,claude-sonnet-5")
+    .split(",").map(s => s.trim()).filter(Boolean),
 };
