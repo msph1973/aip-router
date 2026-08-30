@@ -23,16 +23,40 @@ app.use((req, res, next) => {
 });
 
 // ---- Structured logging: readable stdout (for TUI) + full JSONL file (catch-all) ----
-import { appendFileSync, mkdirSync } from "fs";
+import { appendFileSync, mkdirSync, statSync, existsSync, renameSync, unlinkSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
 const LOG_DIR = join(homedir(), ".aip-router");
 const LOG_FILE = join(LOG_DIR, "router.jsonl");
 
+// D2: bounded JSONL rotation. When the active file crosses CONFIG.logMaxBytes,
+// shift router.jsonl -> .1, .1 -> .2, ..., dropping the oldest beyond
+// CONFIG.logRotate, and start a fresh file. Pure ops — never touches the
+// request path and never throws (logging must never crash the router).
+function rotateJsonl() {
+  if (CONFIG.logMaxBytes <= 0 || CONFIG.logRotate <= 0) return;
+  if (!existsSync(LOG_FILE)) return;
+  if (statSync(LOG_FILE).size < CONFIG.logMaxBytes) return;
+
+  // Drop the oldest archive (.N -> deleted) — bounded storage.
+  const oldest = `${LOG_FILE}.${CONFIG.logRotate}`;
+  if (existsSync(oldest)) unlinkSync(oldest);
+
+  // Shift intermediate archives down: .N-1 -> .N, ..., .1 -> .2.
+  for (let i = CONFIG.logRotate - 1; i >= 1; i--) {
+    const src = `${LOG_FILE}.${i}`;
+    if (existsSync(src)) renameSync(src, `${LOG_FILE}.${i + 1}`);
+  }
+
+  // Rotate the active file into .1 and start fresh.
+  if (existsSync(LOG_FILE)) renameSync(LOG_FILE, `${LOG_FILE}.1`);
+}
+
 function writeJsonl(entry) {
   try {
     mkdirSync(LOG_DIR, { recursive: true });
+    rotateJsonl();
     appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n");
   } catch (_) { /* logging must never crash the router */ }
 }
