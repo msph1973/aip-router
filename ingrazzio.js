@@ -282,13 +282,66 @@ function extractTextContent(msg) {
   return "";
 }
 
+// Pecah data URL gambar menjadi { mediaType, data }.
+// Penting: media type HARUS diambil dari data URL, tidak boleh di-hardcode.
+// Anthropic memvalidasi header byte gambar terhadap media_type yang dikirim dan
+// menolak dengan 400 invalid_request_error bila keduanya tidak cocok
+// ("The image was specified using the image/jpeg media type, but the image
+// appears to be a image/png image").
+const IMAGE_MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+function parseImageUrl(url) {
+  const raw = typeof url === "string" ? url : "";
+  const m = raw.match(/^data:([^;,]+)(;base64)?,(.*)$/s);
+  if (!m) return { mediaType: null, data: "", url: raw };
+
+  let mediaType = (m[1] || "").toLowerCase().trim();
+  const data = m[3] || "";
+
+  // Normalisasi alias yang lazim dipakai klien.
+  if (mediaType === "image/jpg") mediaType = "image/jpeg";
+
+  // Byte gambar adalah sumber kebenaran, BUKAN label dari klien.
+  // Klien sering salah menandai (mis. screenshot PNG dikirim sebagai
+  // image/jpeg); Anthropic memeriksa byte dan menolak dengan 400 bila label
+  // tidak cocok. Jadi bila sniff berhasil, sniff yang menang.
+  const sniffed = sniffImageMediaType(data);
+  if (sniffed) mediaType = sniffed;
+  else if (!IMAGE_MEDIA_TYPES.has(mediaType)) mediaType = "image/jpeg";
+
+  return { mediaType, data, url: null };
+}
+
+// Deteksi tipe gambar dari beberapa byte pertama payload base64.
+// Prefix base64 stabil untuk tiap format karena base64 memetakan 3 byte → 4 char.
+function sniffImageMediaType(b64) {
+  const head = (b64 || "").slice(0, 16);
+  if (head.startsWith("iVBORw0KGgo")) return "image/png";   // \x89PNG\r\n\x1a\n
+  if (head.startsWith("/9j/")) return "image/jpeg";          // \xFF\xD8\xFF
+  if (head.startsWith("R0lGOD")) return "image/gif";         // GIF8
+  if (head.startsWith("UklGR")) return "image/webp";         // RIFF….WEBP
+  return null;
+}
+
+// Tebak mime type dari ekstensi URL (jalur URL biasa, bukan data URL).
+function mediaTypeFromUrl(url) {
+  const ext = String(url).split("?")[0].split("#")[0].toLowerCase().match(/\.(\w+)$/)?.[1];
+  if (ext === "png") return "image/png";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  return "image/jpeg";
+}
+
 function translateContentToAnthropic(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content.map(part => {
       if (part.type === "text") return { type: "text", text: part.text };
       if (part.type === "image_url") {
-        return { type: "image", source: { type: "base64", media_type: "image/jpeg", data: part.image_url?.url?.replace(/^data:image\/\w+;base64,/, "") || "" } };
+        const { mediaType, data, url } = parseImageUrl(part.image_url?.url);
+        // URL biasa (bukan data URL) — Anthropic menerima source.type "url".
+        if (url) return { type: "image", source: { type: "url", url } };
+        return { type: "image", source: { type: "base64", media_type: mediaType, data } };
       }
       return part;
     });
@@ -346,8 +399,12 @@ export function translateOpenAIToGoogle(body, modelInfo) {
       for (const p of msg.content) {
         if (p.type === "text") parts.push({ text: p.text });
         else if (p.type === "image_url") {
-          const data = p.image_url?.url?.replace(/^data:image\/\w+;base64,/, "") || "";
-          parts.push({ inline_data: { mime_type: "image/jpeg", data } });
+          // Sama seperti jalur Anthropic: mime type harus mengikuti data URL,
+          // bukan di-hardcode image/jpeg. Gemini juga menolak/mis-decode bila
+          // mime_type tidak cocok dengan byte gambar.
+          const { mediaType, data, url } = parseImageUrl(p.image_url?.url);
+          if (url) parts.push({ file_data: { mime_type: mediaTypeFromUrl(url), file_uri: url } });
+          else parts.push({ inline_data: { mime_type: mediaType, data } });
         }
       }
     }
