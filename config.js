@@ -40,6 +40,14 @@ export const CONFIG = {
   headroomEnabled: process.env.HEADROOM_ENABLED === "true",
   headroomThreshold: parseInt(process.env.HEADROOM_THRESHOLD || "80", 10),
 
+  // Reasoning budget knob (A3). "off" (default) keeps deepseek's
+  // reasoning_content untouched — the earlier decision was NOT to strip
+  // reasoning by default (it is 19–99% of completion tokens and removing it
+  // can lower answer quality). Set AIP_BUDGET=strip (or per-request header
+  // X-AIP-Budget: strip) to opt into stripping reasoning_content from
+  // non-stream deepseek responses and save quota deliberately.
+  reasoningBudget: process.env.AIP_BUDGET || "off",
+
   // Default max output tokens when the client doesn't set one. 8192 is the
   // previous Anthropic default — generous but wasteful for agents that don't
   // care how long the reply is. 2048 is a sane floor that still covers most
