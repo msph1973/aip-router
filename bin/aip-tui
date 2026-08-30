@@ -53,9 +53,7 @@ function saveConfig(cfg) {
 // h() = JSX tanpa build step
 const h = React.createElement;
 
-const HISTORY_MAX = 60;
 const LOG_MAX = 2000; // entri log maksimum yang disimpan dalam buffer
-const LOG_PANEL_HEIGHT = 16; // tinggi panel log di dashboard view
 
 // ---- Styling log berdasarkan konten (mencocokkan struktur log server) ----
 // Prioritas: baris-error selalu merah; token cyan; RTK hijau; done putih;
@@ -72,43 +70,6 @@ function styleLogLine(text) {
   if (t.startsWith("[Ingrazzio]")) return { color: "yellow" };
   return { color: "white", dimColor: true };
 }
-function statusToText(s) {
-  if (s === null || s === undefined) return null;
-  if (s < 200 || s >= 300) return null;
-  return h(Text, { dimColor: true }, String(s));
-}
-
-// ---- Sparkline (ASCII block chart) ----
-function Sparkline({ data, width = 14, height = 3, color = "cyan" }) {
-  const samples = data.slice(-width);
-  if (samples.length < 2) return h(Text, { dimColor: true }, " · menunggu ·");
-  const max = Math.max(...samples.map(s => s.value), 1);
-  const rows = [];
-  for (let r = 0; r < height; r++) {
-    let line = "";
-    for (let c = 0; c < width; c++) {
-      const idx = Math.max(0, samples.length - width + c);
-      const hgt = Math.max(1, Math.round((samples[idx].value / max) * height));
-      line += r < hgt ? "\u2588" : " ";
-    }
-    rows.push(h(Text, { key: r, color }, line));
-  }
-  return h(Box, { flexDirection: "column" }, rows);
-}
-
-// ---- Small presentational atoms ----
-function Dot({ on }) {
-  return h(Text, { color: on ? "green" : "gray" }, on ? "●" : "○");
-}
-function ToggleRow({ label, on, detail, color = "green" }) {
-  return h(Box, {},
-    h(Dot, { on }),
-    h(Text, { dimColor: true }, ` ${label.padEnd(9)}`),
-    h(Text, { bold: true, color: on ? color : "gray" }, on ? "ON" : "OFF"),
-    detail ? h(Text, { dimColor: true }, `  ${detail}`) : null
-  );
-}
-
 // ---- Multi-line wrapped log viewer ----
 // Menampilkan entri log; teks panjang di-wrap penuh (tidak terpotong).
 // `width` menentukan lebar kolom teks; `height` membatasi tinggi viewport.
@@ -163,7 +124,6 @@ function App() {
   const [tokensOut, setTokensOut] = useState(0);
   const [rtkSaved, setRtkSaved] = useState(0);
   const [rtkTotal, setRtkTotal] = useState(0);
-  const [hist, setHist] = useState([]);
   const [modal, setModal] = useState(null);
   const [flash, setFlash] = useState(null);
 
@@ -296,17 +256,6 @@ function App() {
     addLog("Stopping…", "yellow");
   }, [addLog, setFlashMsg]);
 
-  // Update history when token counters change
-  useEffect(() => {
-    setHist(prev => {
-      if (prev.length === 0) return prev.concat({ t: Date.now(), in: tokensIn, out: tokensOut });
-      const last = prev[prev.length - 1];
-      if (last.in === tokensIn && last.out === tokensOut) return prev;
-      const minusLast = prev.slice(0, -1);
-      return minusLast.concat({ t: Date.now(), in: tokensIn, out: tokensOut }).slice(-HISTORY_MAX);
-    });
-  }, [tokensIn, tokensOut]);
-
   // Auto-start server pada mount jika token sudah dikonfigurasi
   const autoStarted = useRef(false);
   useEffect(() => {
@@ -409,148 +358,116 @@ function App() {
 
   const uptimeMin = health?.uptimeSec != null ? Math.round(health.uptimeSec / 60) : null;
   const junieV = health?.junie?.version;
-  const sparkIn = hist.map(p => ({ value: p.in }));
-  const sparkOut = hist.map(p => ({ value: p.out }));
   const rtkPct = rtkTotal > 0 ? ((rtkSaved / rtkTotal) * 100).toFixed(1) : null;
-
-  // tinggi area log di mode full (layar penuh minus header/footer/flash)
-  const fullLogHeight = Math.max(5, (process.stdout.rows || 24) - 4);
 
   // warna per id untuk LogView
   const cmap = {};
   for (const [id, st] of logColorRef.current) cmap[id] = st;
 
-  // --- FULL LOG MODE: render seluruh layar sebagai log viewer ---
-  if (showFullLog) {
-    const fresh = logScroll === 0 ? true : (logScroll > 1 ? false : null);
-    return h(Box, { flexDirection: "column", width: "100%" },
-      h(Box, { height: 1, borderStyle: "round", borderColor: "cyan", paddingLeft: 1 },
-        h(Text, { bold: true, color: "cyan" }, " FULL LOG "),
-        h(Text, { dimColor: true }, ` ${logs.length} entri  `),
-        h(Text, { color: logScroll > 0 ? "yellow" : "green" }, logScroll > 0 ? `▲ ${logScroll} baris ke atas` : "▶ live"),
-        h(Text, { dimColor: true }, "   F/q/esc keluar   ↑↓/jk scroll   PgUp/PgDn/ud ±20   g home  G live")
-      ),
-      h(Box, { flexDirection: "column", width: "100%", height: fullLogHeight, paddingLeft: 0 },
-        h(LogView, {
-          entries: logs,
-          height: fullLogHeight,
-          width: Math.max(20, (process.stdout.columns || 80) - 2),
-          scrollAt: logScroll,
-          colorMap: cmap,
-        })
-      ),
-      h(Box, { height: 1, paddingLeft: 1 },
-        flash ? h(Text, { color: "yellow", bold: true }, ` ${flash}`) : h(Text, { dimColor: true }, "")
-      )
-    );
-  }
-
-  // --- DASHBOARD MODE ---
-  return h(Box, { flexDirection: "column", width: "100%" },
-    // Header
-    h(Box, { height: 1, borderStyle: "round", borderColor: statusColor, paddingLeft: 1 },
-      h(Text, { color: statusColor, bold: true }, " aip-router "),
-      h(Text, {}, ` ${statusWord} `),
-      h(Text, { dimColor: true }, `:${cfg.port}   up:${uptimeMin != null ? uptimeMin + "m" : "—"}   junie:${junieV || "?"}   tok:${cfg.tokens.filter(t => t.token).length}/${cfg.tokens.length}`)
-    ),
-
-    // Body (3 kolom: Status/Features | Tokens+Chart | Log)
-    h(Box, { flexDirection: "row", width: "100%", height: LOG_PANEL_HEIGHT + 1, borderStyle: "round", borderColor: "gray" },
-
-      // Kolom kiri — Status + Features
-      h(Box, { flexDirection: "column", width: "36%", paddingLeft: 1, paddingTop: 1 },
-        h(Text, { bold: true, color: "cyan" }, " Status"),
-        h(Box, {}, h(Text, { dimColor: true }, "  Request:"), h(Text, { color: "yellow" }, ` ${reqCount}`)),
-        h(Box, {}, h(Text, { dimColor: true }, "  Tokens in:"), h(Text, { color: "cyan" }, ` ${tokensIn.toLocaleString()}`)),
-        h(Box, {}, h(Text, { dimColor: true }, "  Tokens out:"), h(Text, { color: "cyan" }, ` ${tokensOut.toLocaleString()}`)),
-        h(Box, {}, h(Text, { dimColor: true }, "  RTK saved:"), h(Text, { color: "green" }, ` ${rtkSaved.toLocaleString()}B${rtkPct ? ` (${rtkPct}%)` : ""}`)),
-        breaker && h(Box, {},
-          h(Text, { dimColor: true }, "  Circuit:"),
-          h(Text, { bold: true, color: breaker.open ? "red" : "green" }, breaker.open ? " OPEN" : " closed"),
-          h(Text, { dimColor: true }, ` fail=${breaker.failures}/5 req=${breaker.totalRequests}${breaker.reopenInMs ? ` reopen:${Math.round(breaker.reopenInMs / 1000)}s` : ""}`)
+  // --- FULL LOG MODE: render seluruh layar sebagai log viewer (clean) ---
+    if (showFullLog) {
+      const bodyH = Math.max(5, (process.stdout.rows || 24) - 5);
+      return h(Box, { flexDirection: "column", width: "100%", borderStyle: "round", borderColor: "gray" },
+        h(Box, { height: 1, paddingLeft: 1, borderBottom: true, borderColor: "gray" },
+          h(Text, { bold: true, color: "cyan" }, " FULL LOG "),
+          h(Text, { dimColor: true }, `(${logs.length})  `),
+          h(Text, { color: logScroll > 0 ? "yellow" : "green" }, logScroll > 0 ? `▲ ${logScroll}` : "● live"),
+          h(Text, { dimColor: true }, "   ↑↓/jk scroll  PgUp/PgDn/ud ±20  g home  G live  F/esc keluar")
         ),
-        h(Box, {}, h(Text, { dimColor: true }, "  Health:"), h(Text, { color: health?.status === "degraded" ? "yellow" : "green" }, ` ${health?.status ?? "n/a"}`)),
+        h(Box, { flexDirection: "column", height: bodyH, paddingLeft: 1 },
+          h(LogView, { entries: logs, height: bodyH, width: Math.max(30, (process.stdout.columns || 80) - 4), scrollAt: logScroll, colorMap: cmap })
+        ),
+        h(Box, { height: 1, paddingLeft: 1, borderTop: true, borderColor: "gray" },
+          flash ? h(Text, { color: "yellow", bold: true }, ` ${flash}`) : h(Text, { dimColor: true }, "")
+        )
+      );
+    }
 
-        h(Text, {}, " "),
-        h(Text, { bold: true, color: "cyan" }, " Features"),
-        h(ToggleRow, { label: "rtk", on: cfg.rtkEnabled }),
-        h(ToggleRow, { label: "rtkTrunc", on: cfg.rtkTruncate }),
-        h(ToggleRow, { label: "caveman", on: cfg.cavemanEnabled, detail: cfg.cavemanEnabled ? `[${cfg.cavemanLevel}]` : null, color: "magenta" }),
-        h(ToggleRow, { label: "ponytail", on: cfg.ponytailEnabled }),
-        h(ToggleRow, { label: "headroom", on: cfg.headroomEnabled, detail: cfg.headroomEnabled ? `[${cfg.headroomThreshold}%]` : null }),
-        h(Box, {}, h(Text, { dimColor: true }, "  max_tok:"), h(Text, { color: "cyan" }, ` ${cfg.defaultMaxTokens}`))
+    // --- DASHBOARD MODE ---
+    const footerH = 4;   // 2 border + 2 baris teks
+    const statusH = 9;   // 2 border + 1 header + 5 baris data + 1 padding
+    const logH = Math.max(5, (process.stdout.rows || 24) - statusH - footerH - 6);
+
+    return h(Box, { flexDirection: "column", width: "100%" },
+      // Header bar — status inti dalam 1 baris
+      h(Box, { height: 1, borderStyle: "round", borderColor: statusColor, paddingLeft: 1 },
+        h(Text, { color: statusColor, bold: true }, " aip-router "),
+        h(Text, {}, ` ${statusWord} `),
+        h(Text, { dimColor: true }, `:${cfg.port}   up ${uptimeMin != null ? uptimeMin + "m" : "—"}   junie ${junieV || "?"}   tok ${cfg.tokens.filter(t => t.token).length}/${cfg.tokens.length}`)
       ),
 
-      // Kolom tengah — Tokens + Chart
-      h(Box, { flexDirection: "column", width: "26%", paddingLeft: 1, paddingTop: 1 },
-        h(Text, { bold: true, color: "cyan" }, " Tokens"),
-        cfg.tokens.length === 0
-          ? h(Text, { dimColor: true }, "  (kosong — tekan t)")
-          : cfg.tokens.map(t => {
-              const cool = health?.tokens?.find(tk => tk.name === t.name)?.cooldown || 0;
-              const state = !t.token
-                ? h(Text, { color: "red" }, " ✗ kosong")
-                : cool > 0
-                  ? h(Text, { color: "yellow" }, ` ⧗ cooldown ${(cool / 1000).toFixed(0)}s`)
-                  : h(Text, { color: "green" }, " ✓ active");
-              return h(Box, { key: t.name }, h(Text, {}, `  ${t.name}`), state);
-            }),
+      // Baris status atas — dua kelompok info berdampingan (Status | Tokens)
+      h(Box, { flexDirection: "row", height: statusH, borderStyle: "round", borderColor: "gray", paddingTop: 1, paddingLeft: 1 },
 
-        h(Text, {}, " "),
-        h(Text, { bold: true, color: "cyan" }, " Token usage / 1m"),
-        h(Box, { flexDirection: "row" },
-          h(Box, { flexDirection: "column", width: "50%" },
-            h(Text, { dimColor: true }, " in"),
-            h(Sparkline, { data: sparkIn, color: "cyan" })
-          ),
-          h(Box, { flexDirection: "column", width: "50%" },
-            h(Text, { dimColor: true }, " out"),
-            h(Sparkline, { data: sparkOut, color: "green" })
-          )
+        // Kolom kiri — Status
+        h(Box, { flexDirection: "column", width: "46%", paddingRight: 1 },
+          h(Text, { bold: true, color: "cyan" }, " STATUS"),
+          h(Box, {}, h(Text, { dimColor: true }, "  request  "), h(Text, { color: "yellow", bold: true }, `${reqCount}`)),
+          h(Box, {}, h(Text, { dimColor: true }, "  tok-in   "), h(Text, { color: "cyan" }, `${tokensIn.toLocaleString()}`)),
+          h(Box, {}, h(Text, { dimColor: true }, "  tok-out  "), h(Text, { color: "cyan" }, `${tokensOut.toLocaleString()}`)),
+          h(Box, {}, h(Text, { dimColor: true }, "  rtk-save "), h(Text, { color: "green" }, `${rtkSaved.toLocaleString()}B${rtkPct ? ` (${rtkPct}%)` : ""}`)),
+          h(Box, {}, h(Text, { dimColor: true }, "  circuit  "), h(Text, { bold: true, color: breaker?.open ? "red" : "green" }, breaker?.open ? "OPEN" : "closed"),
+            h(Text, { dimColor: true }, ` fail=${breaker?.failures ?? 0}/5`)),
+        ),
+
+        // Kolom kanan — Tokens (ringkas per token)
+        h(Box, { flexDirection: "column", width: "54%", paddingLeft: 1 },
+          h(Text, { bold: true, color: "cyan" }, " TOKENS"),
+          cfg.tokens.length === 0
+            ? h(Text, { dimColor: true }, "  (kosong — tekan t)")
+            : cfg.tokens.map(t => {
+                const cool = health?.tokens?.find(tk => tk.name === t.name)?.cooldown || 0;
+                const st = !t.token
+                  ? h(Text, { color: "red" }, "✗ kosong")
+                  : cool > 0
+                    ? h(Text, { color: "yellow" }, `⧗ ${(cool / 1000).toFixed(0)}s`)
+                    : h(Text, { color: "green" }, "●");
+                return h(Box, { key: t.name }, h(Text, {}, `  ${t.name} `), st);
+              }),
+          h(Box, {}, h(Text, { dimColor: true }, "  health   "), h(Text, { color: health?.status === "degraded" ? "yellow" : "green" }, `${health?.status ?? "n/a"}`))
         )
       ),
 
-      // Kolom kanan — Log (scrollable, wrap, tidak terpotong)
-      h(Box, { flexDirection: "column", width: "38%", paddingLeft: 1, paddingTop: 1 },
-        h(Box, {},
-          h(Text, { bold: true, color: "cyan" }, " Log "),
+      // Log panel — dominan, scrollable, tidak terpotong
+      h(Box, { flexDirection: "column", borderStyle: "round", borderColor: "gray", height: logH + 2 },
+        h(Box, { height: 1, paddingLeft: 1, borderBottom: true, borderColor: "gray" },
+          h(Text, { bold: true, color: "cyan" }, " LOG "),
           h(Text, { dimColor: true }, `(${logs.length})`),
-          logScroll > 0
-            ? h(Text, { color: "yellow" }, ` ▲${logScroll}`)
-            : h(Text, { dimColor: true }, " ●"),
-          h(Text, { dimColor: true }, "  F↕")
+          h(Text, { color: logScroll > 0 ? "yellow" : "green" }, logScroll > 0 ? `  ▲ ${logScroll}` : "  ●"),
+          h(Text, { dimColor: true }, "  ↑↓/jk scroll  g home  G live  F full")
         ),
-        h(LogView, {
-          entries: logs,
-          height: LOG_PANEL_HEIGHT,
-          width: Math.max(24, (process.stdout.columns ? Math.floor(process.stdout.columns * 0.38) : 42) - 2),
-          scrollAt: logScroll,
-          colorMap: cmap,
-        })
+        h(Box, { flexDirection: "column", height: logH, paddingLeft: 1 },
+          h(LogView, {
+            entries: logs,
+            height: logH,
+            width: Math.max(30, (process.stdout.columns || 80) - 4),
+            scrollAt: logScroll,
+            colorMap: cmap,
+          })
+        )
+      ),
+
+      // Modal editor (overlay)
+      modal && h(Box, { borderStyle: "double", borderColor: "magenta", paddingLeft: 1, height: 3, flexDirection: "column", justifyContent: "center" },
+        h(Text, { bold: true }, ` ${modalPrompt(modal)} `),
+        h(Text, { color: "cyan" }, `  ${inputBuf.current}█`)
+      ),
+
+      // Status/flash line
+      h(Box, { height: 1, paddingLeft: 1 },
+        flash
+          ? h(Text, { color: "yellow", bold: true }, ` ${flash}`)
+          : spawning
+            ? h(Box, {}, h(Spinner, { type: "dots" }), h(Text, { dimColor: true }, " menerbitkan server…"))
+            : h(Text, { dimColor: true }, "")
+      ),
+
+      // Footer — 2 baris keymap yang padat & mudah dibaca
+      h(Box, { flexDirection: "column", borderStyle: "round", borderColor: "gray", paddingLeft: 1 },
+        h(Text, { dimColor: true }, " s/x start/stop   F full-log   t token   p port   c caveman   m max_tok"),
+        h(Text, { dimColor: true }, " ↑↓/jk scroll   g home   G live   r trunc   1-4 toggles   q quit")
       )
-    ),
-
-    // Modal editor
-    modal && h(Box, { borderStyle: "double", borderColor: "magenta", paddingLeft: 1, height: 3, flexDirection: "column", justifyContent: "center" },
-      h(Text, { bold: true }, ` ${modalPrompt(modal)} `),
-      h(Text, { color: "cyan" }, `  ${inputBuf.current}█`)
-    ),
-
-    // Status/flash line
-    h(Box, { height: 1, paddingLeft: 1 },
-      flash
-        ? h(Text, { color: "yellow", bold: true }, ` ${flash}`)
-        : spawning
-          ? h(Box, {}, h(Spinner, { type: "dots" }), h(Text, { dimColor: true }, " menerbitkan server…"))
-          : h(Text, { dimColor: true }, "")
-    ),
-
-    // Footer keymap
-    h(Box, { paddingLeft: 1, borderStyle: "round", borderColor: "gray" },
-      h(Text, { dimColor: true },
-        ` s start  x stop  F full-log  ↑↓/jk scroll  g/G home/live  t token  p port  c caveman  m max_tok  1-4 toggles  r trunc  q quit`)
-    )
-  );
+    );
 }
 
 function modalPrompt(m) {
