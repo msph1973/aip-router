@@ -241,12 +241,18 @@ async function tryProxy(path, body, headers, tokenName) {
     try {
       const res = await proxyToIngrazzio(path, body, h);
       if (res.error) {
-        if (res.status === 401 || res.status === 429 || res.status === 403) {
+        // Fail over to the next token on auth/rate-limit/forbidden AND
+        // on transient server errors (5xx) — a downstream 5xx for one token
+        // may succeed with the backup token, so don't give up after the first.
+        const is5xx = res.status >= 500 && res.status < 600;
+        if (res.status === 401 || res.status === 429 || res.status === 403 || is5xx) {
           if (res.status === 429) {
             // Use provider-suggested retry-after if given, else the default 30s.
             const ra = res.retryAfterMs || COOLDOWN_MS;
             tokenCooldowns.set(name, Date.now() + ra);
             log("token", `${name} 429, cooling ${Math.round(ra / 1000)}s (retry-after: ${res.retryAfterMs || "default"})`);
+          } else if (is5xx) {
+            log("token", `${name} ${res.status}, trying next token...`);
           } else {
             log("token", `${name} ${res.status}, trying next...`);
           }
