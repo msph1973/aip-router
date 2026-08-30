@@ -220,6 +220,34 @@ function applyTokenSavers(body) {
   if (CONFIG.headroomEnabled) addHeadroomWarning(body, CONFIG.headroomThreshold);
 }
 
+// A3 reasoning budget — should reasoning_content be stripped from this
+// deepseek response? Opt-in only (default "off", honoring the earlier
+// decision not to strip reasoning). Controlled per-request by header
+// X-AIP-Budget: strip, else by CONFIG.reasoningBudget (env AIP_BUDGET=strip).
+// Only applies to the deepseek family (the model that emits reasoning_content) —
+// gemini/claude reasoning (if any) is handled by their translators already.
+function shouldStripReasoning(req, modelInfo) {
+  const headerVal = (req.get?.("x-aip-budget") || "").toLowerCase();
+  const budget = headerVal || CONFIG.reasoningBudget;
+  const strip = budget === "strip" || budget === "low";
+  if (strip && modelInfo.modelName.toLowerCase().startsWith("deepseek")) {
+    return { active: true, budget };
+  }
+  return { active: false, budget };
+}
+
+// Strip reasoning_content from a parsed deepseek non-stream response.
+function stripReasoning(json) {
+  if (!json || !json.choices) return json;
+  for (const choice of json.choices) {
+    if (choice.message) {
+      delete choice.message.reasoning_content;
+      delete choice.message.reasoning;
+    }
+  }
+  return json;
+}
+
 async function tryProxy(path, body, headers, tokenName) {
   if (!CONFIG.tokens.length) return { error: true, status: 400, body: '{"error":"no tokens configured"}' };
 
@@ -312,6 +340,13 @@ app.all("/v1/chat/completions", async (req, res) => {
   const isStream = body.stream === true;
   body.model = modelInfo.modelName;
 
+  // A3 reasoning budget — evaluated once per request. When active on a
+  // deepseek non-stream response, reasoning_content is stripped before reply.
+  const budget = shouldStripReasoning(req, modelInfo);
+  if (budget.active) {
+    log("budget", `reasoning strip active for ${modelInfo.modelName} (budget=${budget.budget})`);
+  }
+
   applyTokenSavers(body);
   const baseHeaders = {
     "User-Agent": CONFIG.junieUserAgent,
@@ -403,6 +438,8 @@ app.all("/v1/chat/completions", async (req, res) => {
       } else {
         const json = await upstreamRes.json();
         trackUsage(json.usage);
+        // A3: strip reasoning from deepseek non-stream when budget is active.
+        if (budget.active) stripReasoning(json);
         res.json(json);
       }
     }
@@ -503,6 +540,9 @@ app.all("/v1/responses", async (req, res) => {
   });
 
   const isStream = body.stream === true;
+  // A3 reasoning budget — same opt-in contract as /v1/chat/completions.
+  const budget = shouldStripReasoning(req, modelInfo);
+  if (budget.active) log("budget", `reasoning strip active for ${modelInfo.modelName} (responses, budget=${budget.budget})`);
   // Build a chat-completion-shaped payload the existing family branches understand
   const chatBody = {
     model: modelInfo.modelName,
@@ -593,6 +633,10 @@ app.all("/v1/responses", async (req, res) => {
         json = await upstreamRes.json();
       }
       trackUsage(json.usage);
+      // A3: strip reasoning from deepseek non-stream when budget is active.
+      // chatToResponsesOutput only carries message.content, but stripping here
+      // keeps the budget contract explicit and future-proof.
+      if (budget.active) stripReasoning(json);
       res.json(chatToResponsesOutput(json, modelInfo));
     }
     STATS.requests++;
