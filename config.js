@@ -58,4 +58,11 @@ export const CONFIG = {
   // Only these three are supported/expected to work through the router.
   models: (process.env.AIP_MODELS || "deepseek-v4-flash,gemini-3.7-flash,claude-sonnet-5")
     .split(",").map(s => s.trim()).filter(Boolean),
+
+  // JSONL log rotation (D2). router.jsonl grows unbounded while the server
+  // runs; these bound it. AIP_LOG_MAX_BYTES is the size at which the current
+  // file rolls, AIP_LOG_ROTATE is how many rotated backups are kept (oldest
+  // dropped). Both are pure ops knobs — they never touch the request path.
+  logMaxBytes: parseInt(process.env.AIP_LOG_MAX_BYTES || (5 * 1024 * 1024), 10),
+  logRotate: parseInt(process.env.AIP_LOG_ROTATE || "3", 10),
 };
