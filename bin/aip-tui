@@ -2,12 +2,17 @@
 /**
  * aip-tui — AIP Router dashboard (Ink/React rewrite)
  *
- * Upgrade dari blessed.js (dead sejak 2016) ke Ink v7 (React untuk CLI,
- * dipakai Claude Code & Gemini CLI). Tanpa build step: JSX ditulis sebagai
- * react.createElement(nama, props, ...) sehingga file ini ESM polos.
+ * Desain ulang: log panel kini KOMPREHENSIF & TIDAK TERPOTONG.
+ *  - Buffer in-memory besar (2000 entri).
+ *  - Panel dapat di-scroll (k/j/↑/↓, PgUp/PgDn, g/G home/end).
+ *  - Mode FULL LOG (F): seluruh layar jadi log viewer; panjang di-wrap penuh,
+ *    tidak ada teks yang dipotong.
+ *  - Setiap baris log diwarnai berdasarkan konten ([req]/[done]/[token]/[RTK]/
+ *    error), mencerminkan struktur log server (stdout + JSONL di
+ *    ~/.aip-router/router.jsonl).
  *
- * Catatan Ink: styling memakai props React (`color`, `bold`, `dimColor`),
- * BUKAN ANSI escape code literal. Semua teks dibungkus <Text>.
+ * Teknis: tanpa build step — JSX ditulis sebagai react.createElement.
+ * Styling memakai props React (color/bold), BUKAN ANSI escape literal.
  */
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
@@ -49,8 +54,31 @@ function saveConfig(cfg) {
 const h = React.createElement;
 
 const HISTORY_MAX = 60;
+const LOG_MAX = 2000; // entri log maksimum yang disimpan dalam buffer
+const LOG_PANEL_HEIGHT = 16; // tinggi panel log di dashboard view
 
-// ---- Sparkline (ASCII block chart, animasi lembut) ----
+// ---- Styling log berdasarkan konten (mencocokkan struktur log server) ----
+// Prioritas: baris-error selalu merah; token cyan; RTK hijau; done putih;
+// req cyan-baru; sisanya putih.
+function styleLogLine(text) {
+  const t = text;
+  const isErr =
+    /\[error\]|\[warn\]|threw:|failed:|Exception|Unauthorized|Too Many Requests|Bad Request|Internal Server Error|ReferenceError|circuit open/i.test(t);
+  if (isErr) return { color: "red" };
+  if (t.includes("[token]")) return { color: "cyan" };
+  if (t.includes("[RTK]")) return { color: "green" };
+  if (t.includes("[done]")) return { color: "white" };
+  if (t.includes("[req]")) return { color: "blue" };
+  if (t.startsWith("[Ingrazzio]")) return { color: "yellow" };
+  return { color: "white", dimColor: true };
+}
+function statusToText(s) {
+  if (s === null || s === undefined) return null;
+  if (s < 200 || s >= 300) return null;
+  return h(Text, { dimColor: true }, String(s));
+}
+
+// ---- Sparkline (ASCII block chart) ----
 function Sparkline({ data, width = 14, height = 3, color = "cyan" }) {
   const samples = data.slice(-width);
   if (samples.length < 2) return h(Text, { dimColor: true }, " · menunggu ·");
@@ -80,11 +108,43 @@ function ToggleRow({ label, on, detail, color = "green" }) {
     detail ? h(Text, { dimColor: true }, `  ${detail}`) : null
   );
 }
-function StatusLine({ label, value, color }) {
-  return h(Box, {},
-    h(Text, { color: "cyan", bold: true }, ` ${label}: `),
-    h(Text, { color: color || "white" }, String(value))
+
+// ---- Multi-line wrapped log viewer ----
+// Menampilkan entri log; teks panjang di-wrap penuh (tidak terpotong).
+// `width` menentukan lebar kolom teks; `height` membatasi tinggi viewport.
+// `scrollAt` = offset baris-render dari bawah (0 = paling baru).
+function LogView({ entries, height, width, scrollAt = 0, colorMap }) {
+  if (!entries.length) return h(Text, { dimColor: true }, "  (belum ada log)");
+
+  // --- Bangun list "baris render" (sudah di-wrap, tanpa truncate) ---
+  const renderRows = [];
+  for (const e of entries) {
+    const st = colorMap ? colorMap[e.id] : null;
+    const t = `${e.time} ${e.text}`.trim();
+    if (t.length === 0) { renderRows.push({ e, text: "", color: st?.color, dim: st?.dimColor }); continue; }
+    // wrap manual ke chunk ≤ width (Ink Text wrap="wrap" juga bisa, tapi manual
+    // memberi kontrol scroll dan menghitung tinggi dengan pasti)
+    for (let i = 0; i < t.length; i += Math.max(1, width)) {
+      renderRows.push({ e, text: t.slice(i, i + width), color: st?.color, dim: st?.dimColor });
+    }
+  }
+
+  // scrollAt dalam jumlah baris-render dari bawah
+  const total = renderRows.length;
+  const from = Math.max(0, total - scrollAt - height);
+  const to = Math.min(total, from + height);
+  const visible = renderRows.slice(from, to);
+
+  const lines = visible.map((r, i) =>
+    h(Text, {
+      key: `${r.e.id}-${i}`,
+      color: r.color || "white",
+      dimColor: r.dim || null,
+      wrap: "truncate",
+    }, r.text)
   );
+  // indentasi tiap baris
+  return h(Box, { flexDirection: "column" }, lines);
 }
 
 // ---- Main App ----
@@ -95,7 +155,9 @@ function App() {
   const [running, setRunning] = useState(false);
   const [spawning, setSpawning] = useState(false);
   const [health, setHealth] = useState(null);
-  const [logs, setLogs] = useState([]);
+  const [logs, setLogs] = useState([]);        // full in-memory buffer
+  const [logScroll, setLogScroll] = useState(0); // baris-render dari bawah
+  const [showFullLog, setShowFullLog] = useState(false);
   const [reqCount, setReqCount] = useState(0);
   const [tokensIn, setTokensIn] = useState(0);
   const [tokensOut, setTokensOut] = useState(0);
@@ -110,6 +172,7 @@ function App() {
   const flashTimerRef = useRef(null);
   const logSeq = useRef(0);
   const logStack = useRef([]);
+  const logColorRef = useRef(new Map()); // id -> {color,dimColor}
   const inputBuf = useRef("");
 
   // ---- helpers ----
@@ -119,11 +182,22 @@ function App() {
     flashTimerRef.current = setTimeout(() => setFlash(null), 4000);
   }, []);
 
-  const addLog = useCallback((text, color = "white") => {
-    const e = { id: ++logSeq.current, time: new Date().toLocaleTimeString(), text, color };
+  // Tambah log; terima (text, color). Bila color null, otomatis di-style.
+  const addLog = useCallback((text, color) => {
+    const id = ++logSeq.current;
+    const styling = color ? { color } : styleLogLine(text);
+    logColorRef.current.set(id, styling);
+    const e = { id, time: new Date().toLocaleTimeString(), text };
     logStack.current.push(e);
-    if (logStack.current.length > 80) logStack.current.shift();
+    if (logStack.current.length > LOG_MAX) {
+      const dropped = logStack.current.length - LOG_MAX;
+      logStack.current = logStack.current.slice(-LOG_MAX);
+      // bersihkan map warna untuk entri yang dibuang
+      for (const d of logStack.current.slice(0, dropped)) logColorRef.current.delete(d.id);
+    }
     setLogs([...logStack.current]);
+    // Hapus scroll reset: biarkan posisi user (live atau sedang menggulir ke atas)
+    // dipertahankan saat log baru masuk. Untuk kembali ke bawah, tekan G.
   }, []);
 
   const updateCfg = useCallback(updater => {
@@ -141,7 +215,6 @@ function App() {
       .then(d => {
         if (!d) return null;
         setHealth(d);
-        // Server-side usage counters are authoritative (no regex on logs)
         if (d.usage) {
           setReqCount(d.usage.requests);
           setTokensIn(d.usage.tokensIn);
@@ -172,31 +245,35 @@ function App() {
     serverRef.current = child;
 
     child.stdout.on("data", d => {
-      for (const line of d.toString().trim().split("\n")) {
-        if (!line) continue;
-        if (line.includes("[Token]")) addLog(line.trim(), "cyan");
-        else if (line.includes("[RTK]")) {
-          const m = line.match(/saved (\d+)B.*\(([\d.]+)%\)/);
+      for (const line of d.toString().split("\n")) {
+        const ln = line.trim();
+        if (!ln) continue;
+        if (ln.includes("[Token]")) { addLog(ln, "cyan"); continue; }
+        if (ln.includes("[RTK]")) {
+          const m = ln.match(/saved (\d+)B.*\(([\d.]+)%\)/);
           const saved = m ? parseInt(m[1], 10) : 0;
           if (saved > 0) {
             setRtkSaved(v => v + saved);
             setRtkTotal(v => v + saved / (parseFloat(m[2]) / 100));
           }
-          addLog(line.trim(), "green");
+          addLog(ln, "green");
+          continue;
         }
-        // [req]/[request]/[done] — just display the line; counters now come
-        // from /health usage (server-side accumulator), not regex on logs.
-        else if (line.includes("[req]") || line.includes("[request]") || line.includes("[done]")) {
-          addLog(line.trim(), "white");
-        } else addLog(line.trim(), "white");
+        // [req]/[done]/[token]/[Ingrazzio]/[error] — auto-styled
+        addLog(ln);
       }
     });
     child.stderr.on("data", d => {
+      for (const line of d.toString().split("\n")) {
+        const ln = line.trim();
+        if (!ln) continue;
+        addLog(ln, "red");
+      }
+      // pertahankan log-error tambahan ke file server.log (legacy)
       const text = d.toString().trim();
       if (!text) return;
-      addLog(text, "red");
       const f = join(CONFIG_DIR, "server.log");
-      writeFileSync(f, (existsSync(f) ? readFileSync(f, "utf8") : "") + text + "\n");
+      try { writeFileSync(f, (existsSync(f) ? readFileSync(f, "utf8") : "") + text + "\n"); } catch {}
     });
     child.on("spawn", () => {
       setRunning(true); setSpawning(false);
@@ -236,7 +313,6 @@ function App() {
     if (autoStarted.current) return;
     if (cfg.tokens.some(t => t.token)) {
       autoStarted.current = true;
-      // delay kecil biar output pertama dirender dulu
       const id = setTimeout(startServer, 600);
       return () => clearTimeout(id);
     }
@@ -248,52 +324,74 @@ function App() {
     if (healthTimerRef.current) clearInterval(healthTimerRef.current);
   }, []);
 
-  // ---- Keyboard (useInput gantikan stdin raw) ----
+  // ---- Keyboard ----
   useInput((input, key) => {
     if (key.ctrlC || key.escape) { exit(); return; }
-    if (key.return) {
-      const val = inputBuf.current.trim();
-      if (modal?.type === "token") {
-        if (val) {
-          const name = modal.name;
-          updateCfg(c => {
-            const i = c.tokens.findIndex(t => t.name === name);
-            const clone = { ...c, tokens: c.tokens.map(t => ({ ...t })) };
+
+    // --- Modal aktif: kunci huruf/digit/edit ---
+    if (modal) {
+      if (key.return) {
+        const val = inputBuf.current.trim();
+        if (modal?.type === "token") {
+          if (val) {
+            const name = modal.name;
+            const i = cfg.tokens.findIndex(t => t.name === name);
+            const clone = { ...cfg, tokens: cfg.tokens.map(t => ({ ...t })) };
             const idx = clone.tokens.findIndex(t => t.name === name);
             if (idx >= 0) clone.tokens[idx].token = val;
             else clone.tokens.push({ name, token: val });
-            return clone;
-          });
-          setFlashMsg(`Token "${name}" ${val ? "diset" : "dikosongkan"}`);
+            updateCfg(() => clone);
+            setFlashMsg(`Token "${name}" ${val ? "diset" : "dikosongkan"}`);
+          }
+        } else if (modal?.type === "port") {
+          const n = parseInt(val, 10);
+          if (n > 0) { updateCfg(c => ({ ...c, port: n })); setFlashMsg(`Port → ${n}`); }
+          else setFlashMsg("Port tidak valid");
+        } else if (modal?.type === "caveman") {
+          if (["lite", "full", "ultra"].includes(val)) { updateCfg(c => ({ ...c, cavemanLevel: val })); setFlashMsg(`Caveman → ${val}`); }
+          else setFlashMsg("Level: lite/full/ultra");
+        } else if (modal?.type === "maxtok") {
+          const n = parseInt(val, 10);
+          if (n > 0) { updateCfg(c => ({ ...c, defaultMaxTokens: n })); setFlashMsg(`max_tokens → ${n}`); }
+          else setFlashMsg("Angka tidak valid");
         }
-      } else if (modal?.type === "port") {
-        const n = parseInt(val, 10);
-        if (n > 0) { updateCfg(c => ({ ...c, port: n })); setFlashMsg(`Port → ${n}`); }
-        else setFlashMsg("Port tidak valid");
-      } else if (modal?.type === "caveman") {
-        if (["lite", "full", "ultra"].includes(val)) { updateCfg(c => ({ ...c, cavemanLevel: val })); setFlashMsg(`Caveman → ${val}`); }
-        else setFlashMsg("Level: lite/full/ultra");
-      } else if (modal?.type === "maxtok") {
-        const n = parseInt(val, 10);
-        if (n > 0) { updateCfg(c => ({ ...c, defaultMaxTokens: n })); setFlashMsg(`max_tokens → ${n}`); }
-        else setFlashMsg("Angka tidak valid");
+        inputBuf.current = "";
+        setModal(null);
+        return;
       }
-      inputBuf.current = "";
-      setModal(null);
-      return;
-    }
-    if (modal) {
       if (key.delete || key.backspace) inputBuf.current = inputBuf.current.slice(0, -1);
-      else if (input && !key.ctrl) inputBuf.current += input;
+      else if (input && !key.ctrl && !key.meta && !key.escape && !key.tab && !key.return) inputBuf.current += input;
       return;
     }
-    // global keys
+
+    // --- Mode FULL LOG: F / Esc kembali, scroll bebas ---
+    if (showFullLog) {
+      if (input === "f" || input === "F" || key.escape || input === "q") { setShowFullLog(false); return; }
+      // scroll log
+      if (key.upArrow || input === "k") setLogScroll(s => Math.min(s + 1, 100000));
+      else if (key.downArrow || input === "j") setLogScroll(s => Math.max(0, s - 1));
+      else if (key.pageUp || input === "u") setLogScroll(s => Math.min(s + 20, 100000));
+      else if (key.pageDown || input === "d") setLogScroll(s => Math.max(0, s - 20));
+      else if (key.home || input === "g") setLogScroll(100000);
+      else if (key.end || input === "G") setLogScroll(0);
+      return;
+    }
+
+    // --- Dashboard: global keys ---
     if (input === "s" || input === "S") startServer();
     else if (input === "x" || input === "X") stopServer();
+    else if (input === "f" || input === "F") setShowFullLog(true);
     else if (input === "t") { inputBuf.current = ""; setModal({ type: "token", name: "aip" }); }
     else if (input === "p") { inputBuf.current = ""; setModal({ type: "port" }); }
     else if (input === "c") { inputBuf.current = ""; setModal({ type: "caveman" }); }
     else if (input === "m") { inputBuf.current = ""; setModal({ type: "maxtok" }); }
+    // scroll panel log (dashboard)
+    else if (key.upArrow || input === "k") setLogScroll(s => Math.min(s + 1, 100000));
+    else if (key.downArrow || input === "j") setLogScroll(s => Math.max(0, s - 1));
+    else if (key.pageUp || input === "u") setLogScroll(s => Math.min(s + 20, 100000));
+    else if (key.pageDown || input === "d") setLogScroll(s => Math.max(0, s - 20));
+    else if (key.home || input === "g") setLogScroll(100000);
+    else if (key.end || input === "G") setLogScroll(0);
     else if (input === "1") updateCfg(c => ({ ...c, rtkEnabled: !c.rtkEnabled }));
     else if (input === "2") updateCfg(c => ({ ...c, cavemanEnabled: !c.cavemanEnabled }));
     else if (input === "3") updateCfg(c => ({ ...c, ponytailEnabled: !c.ponytailEnabled }));
@@ -311,13 +409,43 @@ function App() {
 
   const uptimeMin = health?.uptimeSec != null ? Math.round(health.uptimeSec / 60) : null;
   const junieV = health?.junie?.version;
-
   const sparkIn = hist.map(p => ({ value: p.in }));
   const sparkOut = hist.map(p => ({ value: p.out }));
-
   const rtkPct = rtkTotal > 0 ? ((rtkSaved / rtkTotal) * 100).toFixed(1) : null;
 
-  // ---- render ----
+  // tinggi area log di mode full (layar penuh minus header/footer/flash)
+  const fullLogHeight = Math.max(5, (process.stdout.rows || 24) - 4);
+
+  // warna per id untuk LogView
+  const cmap = {};
+  for (const [id, st] of logColorRef.current) cmap[id] = st;
+
+  // --- FULL LOG MODE: render seluruh layar sebagai log viewer ---
+  if (showFullLog) {
+    const fresh = logScroll === 0 ? true : (logScroll > 1 ? false : null);
+    return h(Box, { flexDirection: "column", width: "100%" },
+      h(Box, { height: 1, borderStyle: "round", borderColor: "cyan", paddingLeft: 1 },
+        h(Text, { bold: true, color: "cyan" }, " FULL LOG "),
+        h(Text, { dimColor: true }, ` ${logs.length} entri  `),
+        h(Text, { color: logScroll > 0 ? "yellow" : "green" }, logScroll > 0 ? `▲ ${logScroll} baris ke atas` : "▶ live"),
+        h(Text, { dimColor: true }, "   F/q/esc keluar   ↑↓/jk scroll   PgUp/PgDn/ud ±20   g home  G live")
+      ),
+      h(Box, { flexDirection: "column", width: "100%", height: fullLogHeight, paddingLeft: 0 },
+        h(LogView, {
+          entries: logs,
+          height: fullLogHeight,
+          width: Math.max(20, (process.stdout.columns || 80) - 2),
+          scrollAt: logScroll,
+          colorMap: cmap,
+        })
+      ),
+      h(Box, { height: 1, paddingLeft: 1 },
+        flash ? h(Text, { color: "yellow", bold: true }, ` ${flash}`) : h(Text, { dimColor: true }, "")
+      )
+    );
+  }
+
+  // --- DASHBOARD MODE ---
   return h(Box, { flexDirection: "column", width: "100%" },
     // Header
     h(Box, { height: 1, borderStyle: "round", borderColor: statusColor, paddingLeft: 1 },
@@ -326,11 +454,11 @@ function App() {
       h(Text, { dimColor: true }, `:${cfg.port}   up:${uptimeMin != null ? uptimeMin + "m" : "—"}   junie:${junieV || "?"}   tok:${cfg.tokens.filter(t => t.token).length}/${cfg.tokens.length}`)
     ),
 
-    // Body (3 kolom)
-    h(Box, { flexDirection: "row", width: "100%", height: 17, borderStyle: "round", borderColor: "gray" },
+    // Body (3 kolom: Status/Features | Tokens+Chart | Log)
+    h(Box, { flexDirection: "row", width: "100%", height: LOG_PANEL_HEIGHT + 1, borderStyle: "round", borderColor: "gray" },
 
       // Kolom kiri — Status + Features
-      h(Box, { flexDirection: "column", width: "40%", paddingLeft: 1, paddingTop: 1 },
+      h(Box, { flexDirection: "column", width: "36%", paddingLeft: 1, paddingTop: 1 },
         h(Text, { bold: true, color: "cyan" }, " Status"),
         h(Box, {}, h(Text, { dimColor: true }, "  Request:"), h(Text, { color: "yellow" }, ` ${reqCount}`)),
         h(Box, {}, h(Text, { dimColor: true }, "  Tokens in:"), h(Text, { color: "cyan" }, ` ${tokensIn.toLocaleString()}`)),
@@ -354,7 +482,7 @@ function App() {
       ),
 
       // Kolom tengah — Tokens + Chart
-      h(Box, { flexDirection: "column", width: "30%", paddingLeft: 1, paddingTop: 1 },
+      h(Box, { flexDirection: "column", width: "26%", paddingLeft: 1, paddingTop: 1 },
         h(Text, { bold: true, color: "cyan" }, " Tokens"),
         cfg.tokens.length === 0
           ? h(Text, { dimColor: true }, "  (kosong — tekan t)")
@@ -382,12 +510,23 @@ function App() {
         )
       ),
 
-      // Kolom kanan — Log
-      h(Box, { flexDirection: "column", width: "30%", paddingLeft: 1, paddingTop: 1 },
-        h(Text, { bold: true, color: "cyan" }, " Request Log"),
-        logs.length === 0
-          ? h(Text, { dimColor: true }, "  (kosong)")
-          : logs.slice(-38).map(l => h(Text, { key: l.id, color: l.color }, ` ${l.time} ${l.text}`))
+      // Kolom kanan — Log (scrollable, wrap, tidak terpotong)
+      h(Box, { flexDirection: "column", width: "38%", paddingLeft: 1, paddingTop: 1 },
+        h(Box, {},
+          h(Text, { bold: true, color: "cyan" }, " Log "),
+          h(Text, { dimColor: true }, `(${logs.length})`),
+          logScroll > 0
+            ? h(Text, { color: "yellow" }, ` ▲${logScroll}`)
+            : h(Text, { dimColor: true }, " ●"),
+          h(Text, { dimColor: true }, "  F↕")
+        ),
+        h(LogView, {
+          entries: logs,
+          height: LOG_PANEL_HEIGHT,
+          width: Math.max(24, (process.stdout.columns ? Math.floor(process.stdout.columns * 0.38) : 42) - 2),
+          scrollAt: logScroll,
+          colorMap: cmap,
+        })
       )
     ),
 
@@ -409,7 +548,7 @@ function App() {
     // Footer keymap
     h(Box, { paddingLeft: 1, borderStyle: "round", borderColor: "gray" },
       h(Text, { dimColor: true },
-        ` s start   x stop   1 rtk   2 caveman   3 ponytail   4 headroom   r trunc   t token   p port   c caveman   m maxtok   q/esc quit`)
+        ` s start  x stop  F full-log  ↑↓/jk scroll  g/G home/live  t token  p port  c caveman  m max_tok  1-4 toggles  r trunc  q quit`)
     )
   );
 }

@@ -22,10 +22,106 @@ app.use((req, res, next) => {
   next();
 });
 
-// Structured logging with timestamps
+// ---- Structured logging: readable stdout (for TUI) + full JSONL file (catch-all) ----
+import { appendFileSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+
+const LOG_DIR = join(homedir(), ".aip-router");
+const LOG_FILE = join(LOG_DIR, "router.jsonl");
+
+function writeJsonl(entry) {
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n");
+  } catch (_) { /* logging must never crash the router */ }
+}
+
+// Human-readable, structured, catch-all logger.
+//  - Prints one line to stdout (kept compact: the TUI streams this line-for-line).
+//  - Appends a *complete* JSON object to router.jsonl (truncation-free audit trail).
 function log(level, ...args) {
   const ts = new Date().toISOString();
-  console.log(`[${ts}] [${level}]`, ...args);
+  const msg = args.map(a => typeof a === "string" ? a : safeStringify(a)).join(" ");
+  // stdout line — same shape as before ([req]/[RTK]/[token]/[done] tokens preserved
+  // so the TUI's log styling keeps working).
+  console.log(`[${ts}] [${level}]`, msg);
+  // JSONL file — always full fidelity.
+  writeJsonl({ ts, level, type: level, message: msg });
+}
+
+// Serialize any value without throwing (JSONL is catch-all, may receive Errors etc.)
+function safeStringify(v) {
+  try { return JSON.stringify(v); } catch { return String(v); }
+}
+
+// Per-request timeline recorder. Stores start time + metadata, emits structured
+// log entries at arrival and completion so every request is fully traceable.
+const REQ_CAP = 200;
+const activeReqs = new Map();
+
+function requestStarted(req, body) {
+  const toolNames = (body.tools || []).map(t => t.function?.name || t.name || "?").filter(Boolean);
+  const msgSummary = (body.messages || []).map(m =>
+    `${m.role}:${typeof m.content === "string" ? m.content.length : Array.isArray(m.content) ? `parts[${m.content.length}]` : "?"}`);
+  const approxTokens = Math.ceil(JSON.stringify(body).length / 3.5);
+  const rec = {
+    id: req.reqId,
+    start: Date.now(),
+    model: body.model,
+    stream: !!body.stream,
+    tools: toolNames,
+    msgSummary,
+    approxTokens,
+    family: null,
+    llmModel: null,
+    token: null,
+  };
+  if (activeReqs.size >= REQ_CAP) activeReqs.delete(activeReqs.keys().next().value);
+  activeReqs.set(req.reqId, rec);
+  log("req",
+    `[${req.reqId}] model=${body.model} stream=${rec.stream} tools=[${toolNames.join(",")}] msgs=[${msgSummary.join("|")}] ~${approxTokens}tok`);
+  return rec;
+}
+
+function requestCompleted(req, outcome) {
+  const rec = activeReqs.get(req.reqId);
+  if (!rec) return;
+  const dur = Date.now() - rec.start;
+  activeReqs.delete(req.reqId);
+  const done = { ...rec, durMs: dur, ...outcome };
+  // stdout — compact single line (TUI styles [done] in white).
+  log("done",
+    `[${req.reqId}] ${outcome.status || "?"} ${outcome.family || rec.family || "?"} ${rec.model} ${dur}ms tok=${rec.token || "?"}${outcome.finishReason ? ` finish=${outcome.finishReason}` : ""}${outcome.err ? ` err=${outcome.err}` : ""}`);
+  writeJsonl({ ts: new Date().toISOString(), level: "done", type: "request_complete", request: done });
+}
+
+// Emergency request-completion if the handler throws before requestCompleted runs.
+function requestFailed(req, e) {
+  const rec = activeReqs.get(req.reqId);
+  if (!rec) return;
+  const dur = Date.now() - rec.start;
+  activeReqs.delete(req.reqId);
+  const done = { ...rec, durMs: dur, status: 502, error: e.message, stack: e.stack };
+  writeJsonl({ ts: new Date().toISOString(), level: "error", type: "request_error", request: done });
+  // stdout line so the TUI shows it even on unexpected throws
+  console.log(`[${new Date().toISOString()}] [error] [${req.reqId}] threw: ${e.message}`);
+}
+
+// Capture the full upstream error body to JSONL (the stdout flattens to one
+// line, but the audit file keeps the complete provider payload).
+function logUpstreamError(req, status, errBody, family) {
+  const rec = activeReqs.get(req.reqId);
+  writeJsonl({
+    ts: new Date().toISOString(),
+    level: "error",
+    type: "upstream_error",
+    reqId: req.reqId,
+    model: rec?.model,
+    family,
+    status,
+    body: errBody,
+  });
 }
 
 // Request ID for per-request tracing
@@ -169,18 +265,37 @@ app.all("/v1/chat/completions", async (req, res) => {
   }
   if (!body || !body.model) return res.status(400).json({ error: "model required" });
 
-  // Request logger — dump model, tools, messages summary to stderr for debugging
-  const toolNames = (body.tools || []).map(t => t.function?.name || t.name || "?").join(",");
-  const msgSummary = (body.messages || []).map(m => `${m.role}:${typeof m.content === "string" ? m.content.length : Array.isArray(m.content) ? `parts[${m.content.length}]` : "?"}`);
-  const approxTokens = JSON.stringify(body).length / 3.5;
-  log("req", `[${req.reqId}] model=${body.model} stream=${!!body.stream} tools=[${toolNames}] msgs=[${msgSummary.join("|")}] ~${Math.ceil(approxTokens)}tok`);
+  // Request timeline — dump model, tools, messages summary (stdout + JSONL).
+  const rec = requestStarted(req, body);
 
   // Shallow-clone to avoid mutating original body (important for retry/debugging)
   body = structuredClone(body);
 
   const modelInfo = resolveModel(body.model);
-  if (!modelInfo) return res.status(400).json({ error: "unknown model" });
-  if (!CONFIG.tokens.length) return res.status(400).json({ error: "no tokens configured" });
+  if (!modelInfo) {
+    requestCompleted(req, { status: 400, family: detectModelFamily(body.model), err: "unknown model" });
+    return res.status(400).json({ error: "unknown model" });
+  }
+  if (!CONFIG.tokens.length) {
+    requestCompleted(req, { status: 400, family: modelInfo.family, err: "no tokens configured" });
+    return res.status(400).json({ error: "no tokens configured" });
+  }
+  rec.family = modelInfo.family;
+  rec.llmModel = modelInfo.llmModel;
+  rec.token = modelInfo.tokenName || "auto";
+
+  // Track the response outcome automatically when it finishes sending. This
+  // catches EVERY path (success, error return, stream end, throw) in one place
+  // and records the real status code + duration to stdout + JSONL.
+  res.once("finish", () => {
+    const status = res.statusCode;
+    const rec2 = activeReqs.get(req.reqId);
+    if (!rec2) return;
+    const outcome = { status, family: rec2.family };
+    // Surface useful non-2xx detail in the flat line.
+    if (status < 200 || status >= 300) outcome.err = `HTTP ${status}`;
+    requestCompleted(req, outcome);
+  });
 
   const isStream = body.stream === true;
   body.model = modelInfo.modelName;
@@ -221,6 +336,7 @@ app.all("/v1/chat/completions", async (req, res) => {
       const upstreamRes = await tryProxy(modelInfo.path, anBody, baseHeaders, modelInfo.tokenName);
       if (upstreamRes.error) {
         const errBody = safeParseJson(upstreamRes.body);
+        logUpstreamError(req, upstreamRes.status, errBody, modelInfo.family);
         return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
       }
       if (isStream) {
@@ -241,6 +357,7 @@ app.all("/v1/chat/completions", async (req, res) => {
       const upstreamRes = await tryProxy(gPath, gBody, baseHeaders, modelInfo.tokenName);
       if (upstreamRes.error) {
         const errBody = safeParseJson(upstreamRes.body);
+        logUpstreamError(req, upstreamRes.status, errBody, modelInfo.family);
         return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
       }
       if (isStream) {
@@ -263,6 +380,7 @@ app.all("/v1/chat/completions", async (req, res) => {
       const upstreamRes = await tryProxy(modelInfo.path, body, baseHeaders, modelInfo.tokenName);
       if (upstreamRes.error) {
         const errBody = safeParseJson(upstreamRes.body);
+        logUpstreamError(req, upstreamRes.status, errBody, modelInfo.family);
         return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
       }
       if (isStream) {
@@ -278,6 +396,7 @@ app.all("/v1/chat/completions", async (req, res) => {
     }
     STATS.requests++;
   } catch (e) {
+    requestFailed(req, e);
     log("error", "Router error:", e.message);
     if (!res.headersSent) return res.status(502).json({ error: e.message });
     res.end();
@@ -346,9 +465,30 @@ app.all("/v1/responses", async (req, res) => {
   const body = typeof req.body === "string" ? safeParseJson(req.body) : req.body;
   if (!body?.model) return res.status(400).json({ error: "model required" });
 
+  // Timeline: stdout + JSONL (same catch-all as /v1/chat/completions).
+  const rec = requestStarted(req, body);
+
   const modelInfo = resolveModel(body.model);
-  if (!modelInfo) return res.status(400).json({ error: "unknown model" });
-  if (!CONFIG.tokens.length) return res.status(400).json({ error: "no tokens configured" });
+  if (!modelInfo) {
+    requestCompleted(req, { status: 400, family: detectModelFamily(body.model), err: "unknown model" });
+    return res.status(400).json({ error: "unknown model" });
+  }
+  if (!CONFIG.tokens.length) {
+    requestCompleted(req, { status: 400, family: modelInfo.family, err: "no tokens configured" });
+    return res.status(400).json({ error: "no tokens configured" });
+  }
+  rec.family = modelInfo.family;
+  rec.llmModel = modelInfo.llmModel;
+  rec.token = modelInfo.tokenName || "auto";
+  rec.api = "responses";
+  res.once("finish", () => {
+    const rec2 = activeReqs.get(req.reqId);
+    if (!rec2) return;
+    const status = res.statusCode;
+    const outcome = { status, family: rec2.family };
+    if (status < 200 || status >= 300) outcome.err = `HTTP ${status}`;
+    requestCompleted(req, outcome);
+  });
 
   const isStream = body.stream === true;
   // Build a chat-completion-shaped payload the existing family branches understand
@@ -396,6 +536,7 @@ app.all("/v1/responses", async (req, res) => {
     const upstreamRes = await tryProxy(upstreamPath, upstreamBody, baseHeaders, modelInfo.tokenName);
     if (upstreamRes.error) {
       const errBody = safeParseJson(upstreamRes.body);
+      logUpstreamError(req, upstreamRes.status, errBody, modelInfo.family);
       return res.status(upstreamRes.status).json({ error: errBody?.error?.message || errBody?.error || upstreamRes.statusText });
     }
 
@@ -444,6 +585,7 @@ app.all("/v1/responses", async (req, res) => {
     }
     STATS.requests++;
   } catch (e) {
+    requestFailed(req, e);
     log("error", "Responses error:", e.message);
     if (!res.headersSent) return res.status(502).json({ error: e.message });
     res.end();
