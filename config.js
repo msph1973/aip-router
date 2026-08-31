@@ -26,18 +26,18 @@ function getTokens() {
 // slips past ordinary comparison guards because every comparison with NaN is
 // false. Anything that isn't a finite integer in range falls back to the
 // default instead of poisoning downstream logic.
-function envInt(raw, fallback, { min = 0 } = {}) {
+function envInt(raw, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
   if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
   const str = String(raw).trim();
   // Reject trailing junk that parseInt would happily ignore.
   if (!/^-?\d+$/.test(str)) return fallback;
   const n = Number.parseInt(str, 10);
-  if (!Number.isFinite(n) || n < min) return fallback;
+  if (!Number.isFinite(n) || n < min || n > max) return fallback;
   return n;
 }
 
 export const CONFIG = {
-  port: envInt(process.env.PORT, 20129, { min: 1 }),
+  port: envInt(process.env.PORT, 20129, { min: 1, max: 65535 }),
   ingrazzioUrl: process.env.INGRAZZIO_URL || "https://ingrazzio-cloud-prod.labs.jb.gg",
 
   tokens: getTokens(),
@@ -80,5 +80,9 @@ export const CONFIG = {
   // dropped). Both are pure ops knobs — they never touch the request path.
   // 0 (or below) on either knob disables rotation entirely.
   logMaxBytes: envInt(process.env.AIP_LOG_MAX_BYTES, 5 * 1024 * 1024),
-  logRotate: envInt(process.env.AIP_LOG_ROTATE, 3),
+  // Capped: rotateJsonl walks this many slots on every write once the
+  // threshold is crossed, so an absurd value would stall the log path
+  // (1,000,000 measured at ~2.1s per write). 64 archives is far past any
+  // real retention need.
+  logRotate: envInt(process.env.AIP_LOG_ROTATE, 3, { max: 64 }),
 };
