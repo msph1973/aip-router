@@ -35,16 +35,22 @@ const LOG_FILE = join(LOG_DIR, "router.jsonl");
 // CONFIG.logRotate, and start a fresh file. Pure ops — never touches the
 // request path and never throws (logging must never crash the router).
 function rotateJsonl() {
-  if (CONFIG.logMaxBytes <= 0 || CONFIG.logRotate <= 0) return;
+  const maxBytes = CONFIG.logMaxBytes;
+  const keep = CONFIG.logRotate;
+  // Defence in depth: config.js already coerces these, but a non-finite value
+  // here would slip past `<=` (every NaN comparison is false) and rotate on
+  // every single write, shredding the audit trail into one-line files.
+  if (!Number.isFinite(maxBytes) || !Number.isFinite(keep)) return;
+  if (maxBytes <= 0 || keep <= 0) return;
   if (!existsSync(LOG_FILE)) return;
-  if (statSync(LOG_FILE).size < CONFIG.logMaxBytes) return;
+  if (statSync(LOG_FILE).size < maxBytes) return;
 
   // Drop the oldest archive (.N -> deleted) — bounded storage.
-  const oldest = `${LOG_FILE}.${CONFIG.logRotate}`;
+  const oldest = `${LOG_FILE}.${keep}`;
   if (existsSync(oldest)) unlinkSync(oldest);
 
   // Shift intermediate archives down: .N-1 -> .N, ..., .1 -> .2.
-  for (let i = CONFIG.logRotate - 1; i >= 1; i--) {
+  for (let i = keep - 1; i >= 1; i--) {
     const src = `${LOG_FILE}.${i}`;
     if (existsSync(src)) renameSync(src, `${LOG_FILE}.${i + 1}`);
   }
