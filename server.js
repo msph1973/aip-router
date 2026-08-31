@@ -209,15 +209,16 @@ async function probeAccount(token, { force = false } = {}) {
   return out;
 }
 
+// Same key set for every token entry so /health.tokens has a stable schema —
+// an unconfigured slot reports nulls rather than omitting the account fields.
 function accountInfoFor(tokenName) {
   const t = CONFIG.tokens.find(x => x.name === tokenName);
-  if (!t || !t.token) return { name: tokenName, configured: false };
-  const probe = accountCache.get(t.token);
+  const probe = t?.token ? accountCache.get(t.token) : null;
   return {
     name: tokenName,
-    configured: true,
-    account: decodeAccountId(t.token),
-    // null = belum diprobe ATAU hasil probe tidak konklusif (lihat verdictFor)
+    configured: !!t?.token,
+    account: t?.token ? decodeAccountId(t.token) : null,
+    // null = belum diprobe ATAU hasil probe tidak konklusif (lihat foldProbe)
     valid: probe ? probe.ok : null,
     status: probe ? probe.status : null,
     org: probe ? probe.org : null,
@@ -748,10 +749,8 @@ app.get("/health", (req, res) => {
   const tokens = CONFIG.tokens.map(t => {
     const cd = tokenCooldowns.get(t.name);
     return {
-      name: t.name,
-      configured: !!t.token,
+      ...accountInfoFor(t.name), // name, configured, account, valid, status, org, checkedAt
       cooldown: cd && cd > Date.now() ? Math.ceil((cd - Date.now()) / 1000) : 0,
-      ...accountInfoFor(t.name), // account, valid, status, org (dari cache)
     };
   });
   const allExhausted = tokens.length > 0 && tokens.every(t => t.cooldown > 0);

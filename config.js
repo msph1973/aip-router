@@ -23,7 +23,7 @@ function getTokens() {
 
 export const CONFIG = {
   port: parseInt(process.env.PORT || "20129", 10),
-  ingrazzioUrl: "https://ingrazzio-cloud-prod.labs.jb.gg",
+  ingrazzioUrl: process.env.INGRAZZIO_URL || "https://ingrazzio-cloud-prod.labs.jb.gg",
 
   tokens: getTokens(),
 

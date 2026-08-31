@@ -156,13 +156,20 @@ export function decodeAccountId(token) {
 // So a single non-200 can't be trusted either way. 401/403 are taken as an
 // immediate auth failure; every other non-200 must repeat FAIL_STREAK times in
 // a row before the token is called invalid, and any 200 resets the streak.
-// `status` 0 means transport error. Returns { ok, fails } where ok is
-// true / false / null (not yet known).
+//
+// `status` 0 means the request never reached upstream (DNS, TCP, TLS, timeout,
+// aborted response). That is evidence about the network, not about the token,
+// so it never advances the auth-failure streak and never flips the verdict —
+// it just leaves the previous verdict (or unknown) in place.
+//
+// Returns { ok, fails } where ok is true / false / null (not yet known).
 const AUTH_FAIL_STATUS = new Set([401, 403]);
-export const FAIL_STREAK = 3; // consecutive non-200 probes before verdict flips
+export const FAIL_STREAK = 3; // consecutive non-200 responses before verdict flips
 
 export function foldProbe(status, prev) {
   if (status === 200) return { ok: true, fails: 0 };
+  // Transport failure: no verdict, no streak progress.
+  if (!status) return { ok: prev?.ok ?? null, fails: prev?.fails || 0 };
   const fails = (prev?.fails || 0) + 1;
   if (AUTH_FAIL_STATUS.has(status)) return { ok: false, fails };
   if (fails >= FAIL_STREAK) return { ok: false, fails };
@@ -174,6 +181,9 @@ export function foldProbe(status, prev) {
 export function httpsGetJson(path, headers, timeoutMs = 10_000) {
   const url = new URL(`${INGRAZZIO_BASE}${path}`);
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+
     const req = https.request(
       {
         hostname: url.hostname,
@@ -190,12 +200,17 @@ export function httpsGetJson(path, headers, timeoutMs = 10_000) {
           const text = Buffer.concat(chunks).toString("utf8");
           let json = null;
           try { json = JSON.parse(text); } catch { /* not json */ }
-          resolve({ status: res.statusCode, json, text });
+          done(resolve, { status: res.statusCode, json, text });
         });
+        // Without these the promise never settles when upstream aborts or the
+        // socket dies mid-body: "end" never fires and an account refresh hangs.
+        res.on("error", (e) => done(reject, e));
+        res.on("aborted", () => done(reject, new Error("response aborted")));
+        res.on("close", () => done(reject, new Error("response closed before end")));
       }
     );
     req.on("timeout", () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
-    req.on("error", reject);
+    req.on("error", (e) => done(reject, e));
     req.end();
   });
 }
