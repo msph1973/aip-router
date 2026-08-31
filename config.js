@@ -78,7 +78,9 @@ export const CONFIG = {
   // runs; these bound it. AIP_LOG_MAX_BYTES is the size at which the current
   // file rolls, AIP_LOG_ROTATE is how many rotated backups are kept (oldest
   // dropped). Both are pure ops knobs — they never touch the request path.
-  // 0 (or below) on either knob disables rotation entirely.
+  // Set either knob to exactly 0 to disable rotation. A negative value is
+  // treated as junk and falls back to the default below (envInt has min 0),
+  // so it does NOT disable rotation.
   logMaxBytes: envInt(process.env.AIP_LOG_MAX_BYTES, 5 * 1024 * 1024),
   // Capped: rotateJsonl walks this many slots on every write once the
   // threshold is crossed, so an absurd value would stall the log path
