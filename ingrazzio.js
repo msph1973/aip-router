@@ -126,6 +126,52 @@ async function extractText(wrapper) {
   return await wrapper.text();
 }
 
+// Decode the account id embedded in a `perm-<b64>.uuid.sig` Junie token.
+// The first segment after `perm-` is base64 of the account id (e.g. an email
+// or an org-scoped id). Returns null when the token isn't perm-shaped.
+export function decodeAccountId(token) {
+  if (!token || typeof token !== "string" || !token.startsWith("perm-")) return null;
+  const first = token.split(".", 1)[0].slice(5); // drop "perm-"
+  if (!first) return null;
+  try {
+    const raw = Buffer.from(first + "==", "base64").toString("utf8");
+    return raw || null;
+  } catch {
+    return null;
+  }
+}
+
+// Lightweight GET helper for account/balance probes (node:https, avoids
+// undici which fails on some VPS node builds). Resolves { status, json, text }.
+export function httpsGetJson(path, headers, timeoutMs = 10_000) {
+  const url = new URL(`${INGRAZZIO_BASE}${path}`);
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: url.pathname + url.search,
+        method: "GET",
+        headers: { ...headers, "Accept": "application/json" },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          let json = null;
+          try { json = JSON.parse(text); } catch { /* not json */ }
+          resolve({ status: res.statusCode, json, text });
+        });
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 // Translate Vertex generateContent response to OpenAI format
 export function translateGoogleResponseToOpenAI(gBody, modelInfo) {
   const candidate = gBody.candidates?.[0];
