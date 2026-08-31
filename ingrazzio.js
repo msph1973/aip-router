@@ -126,6 +126,95 @@ async function extractText(wrapper) {
   return await wrapper.text();
 }
 
+// Decode the account id embedded in a `perm-<b64>.uuid.sig` Junie token.
+// The first segment after `perm-` is base64 of the account id (e.g. an email
+// or an org-scoped id). Returns null when the token isn't perm-shaped.
+const B64_SEGMENT = /^[A-Za-z0-9+/]+={0,2}$/;
+
+export function decodeAccountId(token) {
+  if (!token || typeof token !== "string" || !token.startsWith("perm-")) return null;
+  const first = token.split(".", 1)[0].slice(5); // drop "perm-"
+  if (!first || !B64_SEGMENT.test(first)) return null;
+  // Node's base64 decoder never throws — it silently emits garbage for
+  // non-base64 input. Re-encode and compare (padding-insensitive) so a
+  // malformed token yields null instead of mojibake in the TUI.
+  const buf = Buffer.from(first, "base64");
+  if (buf.length === 0) return null;
+  if (buf.toString("base64").replace(/=+$/, "") !== first.replace(/=+$/, "")) return null;
+  const raw = buf.toString("utf8");
+  // Account ids are printable ASCII (email or org-scoped id); reject anything
+  // with control chars or replacement chars from a bad utf8 decode.
+  if (!/^[\x20-\x7e]+$/.test(raw)) return null;
+  return raw;
+}
+
+// Fold one /v1/me probe result into a validity verdict.
+//
+// /v1/me is not a clean yes/no oracle. Observed against this upstream:
+//   - a revoked/garbage token answers 407 (or 401) consistently
+//   - a known-good token intermittently answers 404 or 407 for a single probe
+// So a single non-200 can't be trusted either way. 401/403 are taken as an
+// immediate auth failure; every other non-200 must repeat FAIL_STREAK times in
+// a row before the token is called invalid, and any 200 resets the streak.
+//
+// `status` 0 means the request never reached upstream (DNS, TCP, TLS, timeout,
+// aborted response). That is evidence about the network, not about the token,
+// so it never advances the auth-failure streak and never flips the verdict —
+// it just leaves the previous verdict (or unknown) in place.
+//
+// Returns { ok, fails } where ok is true / false / null (not yet known).
+const AUTH_FAIL_STATUS = new Set([401, 403]);
+export const FAIL_STREAK = 3; // consecutive non-200 responses before verdict flips
+
+export function foldProbe(status, prev) {
+  if (status === 200) return { ok: true, fails: 0 };
+  // Transport failure: no verdict, no streak progress.
+  if (!status) return { ok: prev?.ok ?? null, fails: prev?.fails || 0 };
+  const fails = (prev?.fails || 0) + 1;
+  if (AUTH_FAIL_STATUS.has(status)) return { ok: false, fails };
+  if (fails >= FAIL_STREAK) return { ok: false, fails };
+  return { ok: prev?.ok ?? null, fails };
+}
+
+// Lightweight GET helper for account/balance probes (node:https, avoids
+// undici which fails on some VPS node builds). Resolves { status, json, text }.
+export function httpsGetJson(path, headers, timeoutMs = 10_000) {
+  const url = new URL(`${INGRAZZIO_BASE}${path}`);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+
+    const req = https.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: url.pathname + url.search,
+        method: "GET",
+        headers: { ...headers, "Accept": "application/json" },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          let json = null;
+          try { json = JSON.parse(text); } catch { /* not json */ }
+          done(resolve, { status: res.statusCode, json, text });
+        });
+        // Without these the promise never settles when upstream aborts or the
+        // socket dies mid-body: "end" never fires and an account refresh hangs.
+        res.on("error", (e) => done(reject, e));
+        res.on("aborted", () => done(reject, new Error("response aborted")));
+        res.on("close", () => done(reject, new Error("response closed before end")));
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
+    req.on("error", (e) => done(reject, e));
+    req.end();
+  });
+}
+
 // Translate Vertex generateContent response to OpenAI format
 export function translateGoogleResponseToOpenAI(gBody, modelInfo) {
   const candidate = gBody.candidates?.[0];
