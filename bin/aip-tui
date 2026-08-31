@@ -450,24 +450,30 @@ function App() {
     // Baris tetap: header(status) 1 + metric-row 1 + flash 1 + footer 2 = 5.
     // Ruang tersisa (minus slop) untuk log panel.
     const footH = 2;   // 2 baris teks footer (keymap + toggle) — TANPA border box
-    const fixedH = 1 + 1 + 1 + footH; // header + metric + flash + footer
+    const fixedH = 1 + 1 + 1 + 1 + footH; // header + metric + token row + flash + footer
     const logH = Math.min(24, Math.max(5, (process.stdout.rows || 24) - fixedH - 2));
 
     // badge warna per kondisi
     const circuitBadge = breaker?.open ? C.error : health?.status === "degraded" ? C.warning : C.success;
     const tokOn = cfg.tokens.filter(t => t.token).length;
+    // Lebar akun dibatasi oleh lebar terminal dibagi jumlah token: metric row
+    // dulu menampung ini dan meluber, memotong nama token sendiri. Sekarang
+    // token punya barisnya sendiri sehingga akun bisa tampil (hampir) penuh.
+    const acctMax = Math.max(8, Math.floor(((process.stdout.columns || 80) - 12) / Math.max(1, cfg.tokens.length)) - 8);
     const tokenBadges = cfg.tokens.map(t => {
       const ht = health?.tokens?.find(tk => tk.name === t.name) || {};
       const cool = ht.cooldown || 0;
       const st = !t.token ? { label: "✗", color: C.error }
         : cool > 0 ? { label: `⧗${(cool / 1000).toFixed(0)}s`, color: C.warning }
           : ht.valid === false ? { label: "✗", color: C.error }
-            : { label: "●", color: C.success };
-      // label akun — potong ke ~12 karakter agar muat di baris metric
-      const acct = ht.account ? (ht.account.length > 12 ? ht.account.slice(0, 12) + "…" : ht.account) : null;
+            : ht.valid === true ? { label: "●", color: C.success }
+              : { label: "?", color: C.muted }; // belum/ tidak konklusif diprobe
+      const acct = ht.account
+        ? (ht.account.length > acctMax ? ht.account.slice(0, acctMax) + "…" : ht.account)
+        : null;
       const acctColor = ht.valid === false ? C.error : ht.valid === true ? C.secondary : C.muted;
-      return h(Box, { key: t.name, flexDirection: "row" },
-        h(Text, {}, ` ${t.name}`),
+      return h(Box, { key: t.name, flexDirection: "row", flexShrink: 0 },
+        h(Text, { bold: true }, ` ${t.name} `),
         h(Badge, { color: st.color }, st.label),
         acct ? h(Text, { dimColor: true, color: acctColor }, ` ${acct}`) : null);
     });
@@ -481,16 +487,21 @@ function App() {
           ` :${cfg.port}  up ${uptimeMin != null ? uptimeMin + "m" : "—"}  junie ${junieV || "?"}  tok ${tokOn}/${cfg.tokens.length}`)
       ),
 
-      // ── Baris metric: badges ringkas (menggantikan 2 box Status|Tokens) ──
+      // ── Baris metric: counter + circuit + health (tanpa token) ──
       h(Box, { flexDirection: "row", marginTop: 0 },
         h(Text, { dimColor: true }, " req "), h(Text, { color: C.warning, bold: true }, `${reqCount}`),
         h(Text, { dimColor: true }, "   in "), h(Text, { color: C.secondary }, `${tokensIn.toLocaleString()}`),
         h(Text, { dimColor: true }, "   out "), h(Text, { color: C.secondary }, `${tokensOut.toLocaleString()}`),
         h(Text, { dimColor: true }, "   rtk "), h(Text, { color: C.success }, `${rtkSaved.toLocaleString()}B${rtkPct ? ` (${rtkPct}%)` : ""}`),
         h(Text, { dimColor: true }, "   circuit "), h(Badge, { color: circuitBadge }, breaker?.open ? "OPEN" : "closed"),
-        ...tokenBadges,
-        h(Box, { flexDirection: "row" }, h(Text, { dimColor: true }, "   health "),
-          h(Badge, { color: health?.status === "degraded" ? C.warning : C.success }, health?.status ?? "n/a"))
+        h(Text, { dimColor: true }, "   health "),
+        h(Badge, { color: health?.status === "degraded" ? C.warning : C.success }, health?.status ?? "n/a")
+      ),
+
+      // ── Baris token: nama + validitas + akun (baris sendiri agar akun muat) ──
+      h(Box, { flexDirection: "row", marginTop: 0 },
+        h(Text, { dimColor: true }, " akun"),
+        ...tokenBadges
       ),
 
       // ── Log panel — dominan, scrollable, tidak terpotong ──

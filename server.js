@@ -5,7 +5,7 @@ import { compressMessages, formatRtkLog } from "./rtk/index.js";
 import { injectCaveman } from "./prompts/caveman.js";
 import { injectPonytail } from "./prompts/ponytail.js";
 import { addHeadroomWarning } from "./headroom.js";
-import { proxyToIngrazzio, translateOpenAIToAnthropic, translateOpenAIToGoogle, translateGoogleResponseToOpenAI, getBreakerState, decodeAccountId, httpsGetJson } from "./ingrazzio.js";
+import { proxyToIngrazzio, translateOpenAIToAnthropic, translateOpenAIToGoogle, translateGoogleResponseToOpenAI, getBreakerState, decodeAccountId, httpsGetJson, foldProbe } from "./ingrazzio.js";
 import { safeParseJson } from "./util.js";
 
 const app = express();
@@ -173,8 +173,8 @@ function trackUsage(usage) {
 // browser session key; /v1/usage returns empty for token auth). What we CAN
 // surface honestly per token: decoded account id + a live validity probe via
 // GET /v1/me. Cached for ACCOUNT_TTL_MS so the TUI polling (2.5s) doesn't
-// hammer upstream.
-const accountCache = new Map(); // token -> { ok, status, account, org, checkedAt }
+// hammer upstream. Verdict folding (flake tolerance) lives in foldProbe.
+const accountCache = new Map(); // token -> { ok, status, account, org, checkedAt, fails }
 const ACCOUNT_TTL_MS = 60_000;  // re-probe at most once a minute
 const JUNIE_PROBE_HEADERS = {
   "User-Agent": CONFIG.junieUserAgent,
@@ -186,36 +186,42 @@ const JUNIE_PROBE_HEADERS = {
   "X-Client-Feature-Id": `junie-cli/${CONFIG.junieVersion}`,
 };
 
-async function probeAccount(token) {
-  const hit = accountCache.get(token);
-  if (hit && Date.now() - hit.checkedAt < ACCOUNT_TTL_MS) return hit;
+async function probeAccount(token, { force = false } = {}) {
+  const prev = accountCache.get(token);
+  if (!force && prev && Date.now() - prev.checkedAt < ACCOUNT_TTL_MS) return prev;
+  const account = decodeAccountId(token);
+  let status = 0;
+  let org = prev?.org ?? null;
+  let error;
   try {
     const r = await httpsGetJson("/v1/me", { ...JUNIE_PROBE_HEADERS, Authorization: `Bearer ${token}` });
-    const account = decodeAccountId(token);
+    status = r.status;
     // /v1/me returns org list; grab the default org name for context if present.
-    const org = r.json?.orgs?.data?.find(o => o.is_default)?.name || r.json?.orgs?.data?.[0]?.name || null;
-    const out = { ok: r.status === 200, status: r.status, account, org, checkedAt: Date.now() };
-    accountCache.set(token, out);
-    return out;
+    org = r.json?.orgs?.data?.find(o => o.is_default)?.name
+      || r.json?.orgs?.data?.[0]?.name
+      || org;
   } catch (e) {
-    const out = { ok: false, status: 0, account: decodeAccountId(token), org: null, checkedAt: Date.now(), error: e.message };
-    accountCache.set(token, out);
-    return out;
+    error = e.message;
   }
+  const { ok, fails } = foldProbe(status, prev);
+  const out = { ok, status, account, org, fails, checkedAt: Date.now(), error };
+  accountCache.set(token, out);
+  return out;
 }
 
 function accountInfoFor(tokenName) {
   const t = CONFIG.tokens.find(x => x.name === tokenName);
   if (!t || !t.token) return { name: tokenName, configured: false };
-  const acct = decodeAccountId(t.token) || null;
   const probe = accountCache.get(t.token);
   return {
     name: tokenName,
     configured: true,
-    account: acct,
-    valid: probe ? probe.ok : null,     // null = belum diprobe
+    account: decodeAccountId(t.token),
+    // null = belum diprobe ATAU hasil probe tidak konklusif (lihat verdictFor)
+    valid: probe ? probe.ok : null,
     status: probe ? probe.status : null,
     org: probe ? probe.org : null,
+    checkedAt: probe ? probe.checkedAt : null,
   };
 }
 
@@ -770,30 +776,36 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Trigger live account probes for every configured token (fire-and-forget;
-// results land in accountCache and appear in subsequent /health responses).
-// Guarded so concurrent calls don't stack duplicate probes.
-let probing = false;
-async function refreshAccountProbes() {
-  if (probing) return;
-  probing = true;
-  try {
-    await Promise.allSettled(
-      CONFIG.tokens.filter(t => t.token).map(t => probeAccount(t.token))
-    );
-  } finally {
-    probing = false;
-  }
+// Trigger live account probes for every configured token. Concurrent callers
+// share one in-flight run instead of returning early with a stale cache, so
+// the TUI's "a" key always resolves against fresh probe results. `force`
+// bypasses the 60s cache — an explicit refresh should actually re-probe,
+// otherwise pressing "a" inside the TTL would be a silent no-op.
+let probingRun = null;
+function refreshAccountProbes({ force = false } = {}) {
+  if (probingRun) return probingRun;
+  probingRun = Promise.allSettled(
+    CONFIG.tokens.filter(t => t.token).map(t => probeAccount(t.token, { force }))
+  ).finally(() => { probingRun = null; });
+  return probingRun;
 }
 
 // Probe once on boot so /health has data immediately for TUI.
 refreshAccountProbes();
 
+// Loopback-only guard. This endpoint is state-changing and fans out one
+// upstream request per configured token, and the server binds all interfaces
+// with CORS "*" and no auth — so remote callers must not be able to trigger it.
+function isLoopback(req) {
+  const ip = req.socket?.remoteAddress || "";
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
 // Explicit refresh endpoint — TUI calls this on demand (key "a").
 app.post("/v1/accounts/refresh", async (req, res) => {
-  await refreshAccountProbes();
-  const infos = CONFIG.tokens.map(t => ({ name: t.name, ...accountInfoFor(t.name) }));
-  res.json({ ok: true, tokens: infos });
+  if (!isLoopback(req)) return res.status(403).json({ error: "loopback only" });
+  await refreshAccountProbes({ force: true });
+  res.json({ ok: true, tokens: CONFIG.tokens.map(t => accountInfoFor(t.name)) });
 });
 
 // OpenAI-standard model discovery (GET /v1/models). Metadata only — never
