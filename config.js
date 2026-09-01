@@ -21,8 +21,23 @@ function getTokens() {
   return [];
 }
 
+// Numeric env knob with a safe fallback. Bare parseInt returns NaN for junk
+// ("abc") and silently truncates units ("5MB" -> 5, "1e6" -> 1), and NaN then
+// slips past ordinary comparison guards because every comparison with NaN is
+// false. Anything that isn't a finite integer in range falls back to the
+// default instead of poisoning downstream logic.
+function envInt(raw, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+  const str = String(raw).trim();
+  // Reject trailing junk that parseInt would happily ignore.
+  if (!/^-?\d+$/.test(str)) return fallback;
+  const n = Number.parseInt(str, 10);
+  if (!Number.isFinite(n) || n < min || n > max) return fallback;
+  return n;
+}
+
 export const CONFIG = {
-  port: parseInt(process.env.PORT || "20129", 10),
+  port: envInt(process.env.PORT, 20129, { min: 1, max: 65535 }),
   ingrazzioUrl: process.env.INGRAZZIO_URL || "https://ingrazzio-cloud-prod.labs.jb.gg",
 
   tokens: getTokens(),
@@ -38,7 +53,7 @@ export const CONFIG = {
   cavemanLevel: process.env.CAVEMAN_LEVEL || "full",
   ponytailEnabled: process.env.PONYTAIL_ENABLED === "true",
   headroomEnabled: process.env.HEADROOM_ENABLED === "true",
-  headroomThreshold: parseInt(process.env.HEADROOM_THRESHOLD || "80", 10),
+  headroomThreshold: envInt(process.env.HEADROOM_THRESHOLD, 80),
 
   // Reasoning budget knob (A3). "off" (default) keeps deepseek's
   // reasoning_content untouched — the earlier decision was NOT to strip
@@ -52,7 +67,7 @@ export const CONFIG = {
   // previous Anthropic default — generous but wasteful for agents that don't
   // care how long the reply is. 2048 is a sane floor that still covers most
   // real answers while bounding runaway responses.
-  defaultMaxTokens: parseInt(process.env.DEFAULT_MAX_TOKENS || "2048", 10),
+  defaultMaxTokens: envInt(process.env.DEFAULT_MAX_TOKENS, 2048, { min: 1 }),
 
   // Models advertised by GET /v1/models (for omp/yaak/junie model discovery).
   // Only these three are supported/expected to work through the router.
@@ -63,6 +78,13 @@ export const CONFIG = {
   // runs; these bound it. AIP_LOG_MAX_BYTES is the size at which the current
   // file rolls, AIP_LOG_ROTATE is how many rotated backups are kept (oldest
   // dropped). Both are pure ops knobs — they never touch the request path.
-  logMaxBytes: parseInt(process.env.AIP_LOG_MAX_BYTES || (5 * 1024 * 1024), 10),
-  logRotate: parseInt(process.env.AIP_LOG_ROTATE || "3", 10),
+  // Set either knob to exactly 0 to disable rotation. A negative value is
+  // treated as junk and falls back to the default below (envInt has min 0),
+  // so it does NOT disable rotation.
+  logMaxBytes: envInt(process.env.AIP_LOG_MAX_BYTES, 5 * 1024 * 1024),
+  // Capped: rotateJsonl walks this many slots on every write once the
+  // threshold is crossed, so an absurd value would stall the log path
+  // (1,000,000 measured at ~2.1s per write). 64 archives is far past any
+  // real retention need.
+  logRotate: envInt(process.env.AIP_LOG_ROTATE, 3, { max: 64 }),
 };
