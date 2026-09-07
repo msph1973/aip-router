@@ -104,6 +104,23 @@ Model prefix syntax:
 
 Streaming didukung penuh dengan SSE baik untuk OpenAI maupun Anthropic models.
 
+#### Claude Code CLI (Anthropic-compatible)
+
+Router juga melayani `POST /v1/messages` (format Anthropic Messages API),
+termasuk penerusan `cache_control` breakpoint agar prompt caching tetap jalan:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:20129
+export ANTHROPIC_AUTH_TOKEN=dummy
+export ANTHROPIC_MODEL=claude-sonnet-5
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+claude
+```
+
+`cache_control` dari client diteruskan kembali ke upstream (maks 4 breakpoint,
+kelebihan dipangkas dari yang terawal). Keluarga `deepseek`/`gemini` tidak
+punya prompt caching berbasis marker — request tetap jalan, tanpa cache.
+
 #### Health Check
 
 ```bash
