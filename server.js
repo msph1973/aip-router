@@ -7,6 +7,7 @@ import { injectPonytail } from "./prompts/ponytail.js";
 import { addHeadroomWarning } from "./headroom.js";
 import { proxyToIngrazzio, translateOpenAIToAnthropic, translateOpenAIToGoogle, translateGoogleResponseToOpenAI, getBreakerState, decodeAccountId, httpsGetJson, foldProbe } from "./ingrazzio.js";
 import { safeParseJson } from "./util.js";
+import { graftAnthropicCache, stripInternalMeta } from "./anthropic-inbound.js";
 
 const app = express();
 
@@ -1032,6 +1033,568 @@ function translateAnthropicResponseToOpenAI(anBody, modelInfo) {
   }
   return { id: anBody.id || `msg_${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: modelInfo.modelName, choices: [{ index: 0, message: msg, finish_reason: finishReason || "stop" }], usage };
 }
+
+// --- Anthropic Messages API inbound (POST /v1/messages) ---
+// Allows Claude Code CLI via ANTHROPIC_BASE_URL=http://localhost:PORT.
+// Direction is the reverse of the existing translators: Anthropic in ->
+// OpenAI (internal pipeline: RTK/caveman/routers) -> Anthropic out.
+// For the anthropic upstream family the non-stream response and the stream
+// are native Anthropic end-to-end (pass-through); other families are
+// normalized through the OpenAI shape first.
+function anthropicSystemToText(system) {
+  if (!system) return "";
+  if (typeof system === "string") return system;
+  if (Array.isArray(system)) {
+    return system.map(b => typeof b === "string" ? b : (b.text || "")).filter(Boolean).join("\n\n");
+  }
+  return "";
+}
+
+function anthropicImageToOpenAI(source) {
+  if (!source || typeof source !== "object") return null;
+  if (source.type === "base64" && source.data) {
+    return { type: "image_url", image_url: { url: `data:${source.media_type};base64,${source.data}` } };
+  }
+  if (source.type === "url" && source.url) {
+    return { type: "image_url", image_url: { url: source.url } };
+  }
+  return null;
+}
+
+function anthropicBlockText(blocks) {
+  if (typeof blocks === "string") return blocks;
+  if (!Array.isArray(blocks)) return "";
+  return blocks.map(p => typeof p === "string" ? p : (p.text || "")).filter(Boolean).join("");
+}
+
+// A block carries a prompt-caching breakpoint when cache_control is present.
+function hasCache(b) {
+  return !!(b && typeof b === "object" && b.cache_control && typeof b.cache_control === "object");
+}
+
+// Attach a breakpoint record to an OpenAI message sidecar (_cache). Same
+// anchor twice keeps the last (idempotent graft, no budget waste).
+function pushMsgCache(msg, anchor, cacheControl) {
+  if (!msg || !cacheControl) return;
+  if (!msg._cache) msg._cache = [];
+  const key = anchor.kind + ":" + (anchor.id || anchor.tool_use_id || "");
+  const rec = { anchor, cacheControl };
+  const i = msg._cache.findIndex(r => (r.anchor.kind + ":" + (r.anchor.id || r.anchor.tool_use_id || "")) === key);
+  if (i >= 0) msg._cache[i] = rec;
+  else msg._cache.push(rec);
+}
+
+function translateAnthropicToOpenAI(anBody) {
+  const oa = { model: anBody.model, messages: [], stream: anBody.stream === true };
+  // System-scope breakpoint sidecar (last marked block wins).
+  if (Array.isArray(anBody.system)) {
+    for (const b of anBody.system) {
+      if (hasCache(b)) oa._sysCache = b.cache_control;
+    }
+  }
+  const sysText = anthropicSystemToText(anBody.system);
+  if (sysText) oa.messages.push({ role: "system", content: sysText });
+
+  for (const msg of anBody.messages || []) {
+    const role = msg.role === "assistant" ? "assistant" : "user";
+    const content = msg.content;
+    if (typeof content === "string") {
+      oa.messages.push({ role, content });
+      continue;
+    }
+    if (!Array.isArray(content)) {
+      oa.messages.push({ role, content: String(content ?? "") });
+      continue;
+    }
+    let acc = []; // pending user text/image parts
+    let accCache = null; // cache_control of the last marked block in acc
+    let asstText = "";
+    let asstTools = [];
+    let asstCache = []; // breakpoint records for the pending assistant message
+    const flushAcc = () => {
+      if (acc.length) {
+        const m = { role, content: acc.length === 1 && acc[0].type === "text" ? acc[0].text : acc };
+        if (accCache) pushMsgCache(m, { kind: "text" }, accCache);
+        oa.messages.push(m);
+        acc = [];
+        accCache = null;
+      }
+    };
+    const flushAssistant = () => {
+      if (asstText || asstTools.length) {
+        const m = { role: "assistant", content: asstText };
+        if (asstTools.length) m.tool_calls = asstTools;
+        for (const r of asstCache) pushMsgCache(m, r.anchor, r.cacheControl);
+        oa.messages.push(m);
+        asstText = "";
+        asstTools = [];
+        asstCache = [];
+      }
+    };
+    for (const b of content) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "text") {
+        if (role === "assistant") {
+          asstText += b.text || "";
+          if (hasCache(b)) {
+            asstCache = asstCache.filter(r => r.anchor.kind !== "text");
+            asstCache.push({ anchor: { kind: "text" }, cacheControl: b.cache_control });
+          }
+        } else {
+          acc.push({ type: "text", text: b.text || "" });
+          if (hasCache(b)) accCache = b.cache_control;
+        }
+      } else if (b.type === "image") {
+        const img = anthropicImageToOpenAI(b.source);
+        if (img) {
+          if (role === "assistant") { flushAssistant(); oa.messages.push({ role: "assistant", content: [img] }); }
+          else {
+            acc.push(img);
+            if (hasCache(b)) accCache = b.cache_control;
+          }
+        }
+      } else if (b.type === "tool_use") {
+        if (role === "assistant") {
+          asstTools.push({ id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) } });
+          if (hasCache(b)) {
+            asstCache = asstCache.filter(r => !(r.anchor.kind === "tool_use" && r.anchor.id === b.id));
+            asstCache.push({ anchor: { kind: "tool_use", id: b.id || "" }, cacheControl: b.cache_control });
+          }
+        } else {
+          flushAcc();
+          const m = { role: "assistant", content: "", tool_calls: [{ id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) } }] };
+          if (hasCache(b)) pushMsgCache(m, { kind: "tool_use", id: b.id || "" }, b.cache_control);
+          oa.messages.push(m);
+        }
+      } else if (b.type === "tool_result") {
+        flushAcc();
+        flushAssistant();
+        const m = { role: "tool", tool_call_id: b.tool_use_id || "", content: anthropicBlockText(b.content) };
+        if (hasCache(b)) pushMsgCache(m, { kind: "tool_result", tool_use_id: b.tool_use_id || "" }, b.cache_control);
+        oa.messages.push(m);
+      }
+    }
+    flushAcc();
+    flushAssistant();
+  }
+
+  if (!oa.messages.length || !oa.messages.some(m => m.role !== "system")) {
+    oa.messages.push({ role: "user", content: "hi" });
+  }
+  if (anBody.max_tokens !== undefined) oa.max_tokens = anBody.max_tokens;
+  if (anBody.temperature !== undefined) oa.temperature = anBody.temperature;
+  if (anBody.top_p !== undefined) oa.top_p = anBody.top_p;
+  if (anBody.stop_sequences) oa.stop = anBody.stop_sequences;
+  if (Array.isArray(anBody.tools) && anBody.tools.length) {
+    oa.tools = anBody.tools.map(t => {
+      const o = {
+        type: "function",
+        function: { name: t.name, description: t.description || "", parameters: t.input_schema || {} },
+      };
+      if (t && t.cache_control && typeof t.cache_control === "object") o._cache = t.cache_control;
+      return o;
+    });
+    const tc = anBody.tool_choice;
+    if (tc) {
+      if (tc.type === "auto") oa.tool_choice = "auto";
+      else if (tc.type === "any") oa.tool_choice = "required";
+      else if (tc.type === "none") oa.tool_choice = "none";
+      else if (tc.type === "tool" && tc.name) oa.tool_choice = { type: "function", function: { name: tc.name } };
+    }
+  }
+  return oa;
+}
+
+function openAIStopToAnthropic(fr) {
+  if (fr === "length") return "max_tokens";
+  if (fr === "tool_calls" || fr === "function_call") return "tool_use";
+  return "end_turn";
+}
+
+function translateOpenAIResponseToAnthropic(oaJson, modelInfo, reqModel) {
+  const choice = oaJson?.choices?.[0];
+  const msg = choice?.message || {};
+  const content = [];
+  const text = typeof msg.content === "string" ? msg.content
+    : Array.isArray(msg.content) ? msg.content.map(p => p.text || "").join("") : "";
+  if (text) content.push({ type: "text", text });
+  for (const tc of msg.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function?.arguments || "{}"); } catch { input = {}; }
+    if (input === null || typeof input !== "object") input = {};
+    content.push({ type: "tool_use", id: tc.id, name: tc.function?.name || "", input });
+  }
+  if (!content.length) content.push({ type: "text", text: "" });
+  const usage = oaJson?.usage
+    ? { input_tokens: oaJson.usage.prompt_tokens ?? 0, output_tokens: oaJson.usage.completion_tokens ?? 0 }
+    : { input_tokens: 0, output_tokens: 0 };
+  return {
+    id: (typeof oaJson?.id === "string" && oaJson.id.startsWith("msg_"))
+      ? oaJson.id
+      : `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model: reqModel || modelInfo.modelName,
+    stop_reason: openAIStopToAnthropic(choice?.finish_reason),
+    stop_sequence: null,
+    usage,
+  };
+}
+
+function anthropicError(status, message, type = "api_error") {
+  return { type: "error", error: { type, message } };
+}
+
+// Native Anthropic SSE -> client verbatim (anthropic upstream family).
+// Bytes pass through unchanged; only peek message_delta usage for STATS.
+async function pipeAnthropicPassthrough(readableStream, res) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const STREAM_TIMEOUT = 120_000;
+  let timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      clearTimeout(timeout);
+      if (done) { if (!res.writableEnded) res.end(); return; }
+      const str = decoder.decode(value, { stream: true });
+      if (!res.writableEnded) res.write(str);
+      buffer += str;
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          const ev = JSON.parse(payload);
+          if (ev.type === "message_delta" && ev.usage) {
+            trackUsage({ input_tokens: ev.usage.input_tokens, output_tokens: ev.usage.output_tokens });
+          } else if (ev.type === "message_start" && ev.message?.usage) {
+            trackUsage({ input_tokens: ev.message.usage.input_tokens, output_tokens: ev.message.usage.output_tokens });
+          }
+        } catch { /* not JSON — ignore */ }
+      }
+      timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+    }
+  } catch (e) {
+    log("error", "Anthropic passthrough:", e.message);
+    if (!res.writableEnded) res.end();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// OpenAI SSE (deepseek/openai upstream family) -> Anthropic SSE.
+async function pipeOpenAIStreamToAnthropic(readableStream, res, modelInfo, reqModel) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const msgId = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const model = reqModel || modelInfo.modelName;
+  const emit = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+  emit("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  let textStarted = false;
+  let textStopped = false;
+  let deltaSent = false;
+  const toolState = new Map(); // openai tool index -> { anthropicIndex, id }
+  let nextIndex = 1;
+  const ensureText = () => {
+    if (!textStarted) {
+      textStarted = true;
+      emit("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    }
+  };
+  const STREAM_TIMEOUT = 120_000;
+  let timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+  const stopReasonOf = fr => (fr === "length" ? "max_tokens" : (fr === "tool_calls" || fr === "function_call") ? "tool_use" : "end_turn");
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      clearTimeout(timeout);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let chunk;
+        try { chunk = JSON.parse(payload); } catch { continue; }
+        if (chunk.usage) trackUsage(chunk.usage);
+        const choice = chunk.choices?.[0];
+        const delta = choice?.delta || {};
+        if (typeof delta.content === "string" && delta.content) {
+          ensureText();
+          emit("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta.content } });
+        }
+        for (const tc of delta.tool_calls || []) {
+          const oi = tc.index ?? 0;
+          let st = toolState.get(oi);
+          if (!st) {
+            st = { anthropicIndex: nextIndex++, id: tc.id || `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}` };
+            toolState.set(oi, st);
+            emit("content_block_start", { type: "content_block_start", index: st.anthropicIndex, content_block: { type: "tool_use", id: st.id, name: tc.function?.name || "", input: {} } });
+          }
+          if (tc.function?.arguments) {
+            emit("content_block_delta", { type: "content_block_delta", index: st.anthropicIndex, delta: { type: "input_json_delta", partial_json: tc.function.arguments } });
+          }
+        }
+        if (choice?.finish_reason) {
+          if (textStarted && !textStopped && toolState.size === 0) {
+            emit("content_block_stop", { type: "content_block_stop", index: 0 });
+            textStopped = true;
+          }
+          for (const st of toolState.values()) emit("content_block_stop", { type: "content_block_stop", index: st.anthropicIndex });
+          toolState.clear();
+          const ev = { type: "message_delta", delta: { stop_reason: stopReasonOf(choice.finish_reason), stop_sequence: null } };
+          if (chunk.usage) ev.usage = { output_tokens: chunk.usage.completion_tokens ?? 0 };
+          emit("message_delta", ev);
+          deltaSent = true;
+        }
+      }
+    }
+  } catch (e) {
+    log("error", "OpenAI->Anthropic SSE:", e.message);
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (textStarted && !textStopped) emit("content_block_stop", { type: "content_block_stop", index: 0 });
+  for (const st of toolState.values()) emit("content_block_stop", { type: "content_block_stop", index: st.anthropicIndex });
+  if (!textStarted && toolState.size === 0) {
+    emit("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    emit("content_block_stop", { type: "content_block_stop", index: 0 });
+  }
+  if (!deltaSent) emit("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } });
+  emit("message_stop", { type: "message_stop" });
+  if (!res.writableEnded) res.end();
+}
+
+// Vertex SSE (gemini upstream family) -> Anthropic SSE (text path).
+async function pipeGoogleStreamToAnthropic(readableStream, res, modelInfo, reqModel) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const msgId = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const model = reqModel || modelInfo.modelName;
+  const emit = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+  emit("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  emit("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+  let stopReason = "end_turn";
+  const STREAM_TIMEOUT = 120_000;
+  let timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      clearTimeout(timeout);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      timeout = setTimeout(() => { try { reader.cancel(); } catch {} if (!res.writableEnded) res.end(); }, STREAM_TIMEOUT);
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let chunk;
+        try { chunk = JSON.parse(payload); } catch { continue; }
+        const cand = chunk.candidates?.[0];
+        for (const part of cand?.content?.parts || []) {
+          if (part.text && !part.thought) {
+            emit("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: part.text } });
+          }
+        }
+        if (cand?.finishReason) {
+          stopReason = cand.finishReason === "MAX_TOKENS" ? "max_tokens" : "end_turn";
+          if (chunk.usageMetadata || chunk.promptTokenCount != null) {
+            trackUsage({ prompt_tokens: chunk.promptTokenCount ?? chunk.usageMetadata?.promptTokenCount ?? 0, completion_tokens: chunk.usageMetadata?.candidatesTokenCount ?? cand?.tokenCount ?? 0 });
+          }
+        } else if (chunk.usageMetadata) {
+          trackUsage({ prompt_tokens: chunk.usageMetadata?.promptTokenCount ?? 0, completion_tokens: chunk.usageMetadata?.candidatesTokenCount ?? 0 });
+        }
+      }
+    }
+  } catch (e) {
+    log("error", "Google->Anthropic SSE:", e.message);
+  } finally {
+    clearTimeout(timeout);
+  }
+  emit("content_block_stop", { type: "content_block_stop", index: 0 });
+  emit("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 0 } });
+  emit("message_stop", { type: "message_stop" });
+  if (!res.writableEnded) res.end();
+}
+
+app.all("/v1/messages", async (req, res) => {
+  // Claude Code CLI sends POST {BASE}/v1/messages with x-api-key + anthropic-version.
+  // Auth is intentionally ignored (same as the OpenAI endpoints: no auth).
+  if (req.method !== "POST") {
+    return res.status(405).json(anthropicError(405, "method not allowed", "invalid_request_error"));
+  }
+  let anBody = req.body;
+  if (typeof anBody === "string") {
+    try { anBody = JSON.parse(anBody); }
+    catch { return res.status(400).json(anthropicError(400, "invalid json", "invalid_request_error")); }
+  }
+  if (!anBody || typeof anBody !== "object") {
+    return res.status(400).json(anthropicError(400, "invalid request", "invalid_request_error"));
+  }
+  if (!anBody.model) {
+    return res.status(400).json(anthropicError(400, "model required", "invalid_request_error"));
+  }
+  if (!Array.isArray(anBody.messages) || !anBody.messages.length) {
+    return res.status(400).json(anthropicError(400, "messages required", "invalid_request_error"));
+  }
+
+  const rec = requestStarted(req, { model: anBody.model, tools: anBody.tools || [], messages: anBody.messages || [], stream: anBody.stream });
+  res.once("finish", () => {
+    const rec2 = activeReqs.get(req.reqId);
+    if (!rec2) return;
+    const status = res.statusCode;
+    const outcome = { status, family: rec2.family, api: "messages" };
+    if (status < 200 || status >= 300) outcome.err = `HTTP ${status}`;
+    requestCompleted(req, outcome);
+  });
+
+  let chatBody;
+  try {
+    chatBody = translateAnthropicToOpenAI(structuredClone(anBody));
+  } catch (e) {
+    return res.status(400).json(anthropicError(400, e.message || "invalid request", "invalid_request_error"));
+  }
+
+  const modelInfo = resolveModel(chatBody.model);
+  if (!modelInfo) {
+    return res.status(400).json(anthropicError(400, "unknown model", "not_found_error"));
+  }
+  if (!CONFIG.tokens.length) {
+    return res.status(400).json(anthropicError(400, "no tokens configured"));
+  }
+  rec.family = modelInfo.family;
+  rec.llmModel = modelInfo.llmModel;
+  rec.token = modelInfo.tokenName || "auto";
+  rec.api = "messages";
+
+  const isStream = anBody.stream === true;
+  chatBody.model = modelInfo.modelName;
+  chatBody.stream = isStream;
+
+  const budget = shouldStripReasoning(req, modelInfo);
+  if (budget.active) {
+    log("budget", `reasoning strip active for ${modelInfo.modelName} (messages, budget=${budget.budget})`);
+  }
+
+  applyTokenSavers(chatBody);
+  const baseHeaders = {
+    "User-Agent": CONFIG.junieUserAgent,
+    "Grazie-Agent": JSON.stringify({ name: "junie:cli", version: CONFIG.junieVersion }),
+    "X-LLM-Model": modelInfo.llmModel,
+    "X-Keep-Path": "true",
+    "X-Accept-EAP-License": "true",
+    "X-Accept-Release-License": "false",
+    "X-Client-Execution-Id": "session-" + (() => {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, "0");
+      const rand = Math.random().toString(36).slice(2, 6);
+      return `${d.getFullYear().toString().slice(2)}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${rand}`;
+    })(),
+    "X-Client-Feature-Id": `junie-cli/${CONFIG.junieVersion}`,
+    "Accept": "text/event-stream,application/json",
+    "Accept-Encoding": "identity",
+    "Content-Type": "application/json",
+  };
+  if (modelInfo.family === "anthropic") {
+    baseHeaders["Anthropic-Version"] = "2023-06-01";
+  } else if (modelInfo.family !== "gemini") {
+    baseHeaders["Openai-Version"] = "2020-11-07";
+  }
+
+  try {
+    if (modelInfo.family === "anthropic") {
+      const anUpBody = translateOpenAIToAnthropic(chatBody, modelInfo);
+      // Forward the client's prompt-cache breakpoints (dropped by the
+      // OpenAI intermediate shape) back onto the upstream Anthropic body.
+      const graft = graftAnthropicCache(anUpBody, chatBody);
+      if (graft.dropped > 0) log("cache", `breakpoints capped: applied ${graft.applied}, dropped ${graft.dropped} for ${modelInfo.modelName}`);
+      else if (graft.applied > 0) log("cache", `forwarded ${graft.applied} cache breakpoint(s) for ${modelInfo.modelName}`);
+      stripInternalMeta(chatBody);
+      const upstreamRes = await tryProxy(modelInfo.path, anUpBody, baseHeaders, modelInfo.tokenName);
+      if (upstreamRes.error) {
+        const errBody = safeParseJson(upstreamRes.body);
+        logUpstreamError(req, upstreamRes.status, errBody, modelInfo.family);
+        return res.status(upstreamRes.status).json(anthropicError(upstreamRes.status, errBody?.error?.message || errBody?.error || upstreamRes.statusText));
+      }
+      if (isStream) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        await pipeAnthropicPassthrough(upstreamRes.body, res);
+      } else {
+        const json = await upstreamRes.json();
+        trackUsage(json.usage ? { input_tokens: json.usage.input_tokens, output_tokens: json.usage.output_tokens } : null);
+        res.json(json);
+      }
+    } else if (modelInfo.family === "gemini") {
+      const gBody = translateOpenAIToGoogle(chatBody, modelInfo);
+      const gPath = isStream ? modelInfo.streamPath : modelInfo.path;
+      const upstreamRes = await tryProxy(gPath, gBody, baseHeaders, modelInfo.tokenName);
+      if (upstreamRes.error) {
+        const errBody = safeParseJson(upstreamRes.body);
+        logUpstreamError(req, upstreamRes.status, errBody, modelInfo.family);
+        return res.status(upstreamRes.status).json(anthropicError(upstreamRes.status, errBody?.error?.message || errBody?.error || upstreamRes.statusText));
+      }
+      if (isStream) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        await pipeGoogleStreamToAnthropic(upstreamRes.body, res, modelInfo, anBody.model);
+      } else {
+        const json = await upstreamRes.json();
+        const oa = translateGoogleResponseToOpenAI(json, modelInfo);
+        trackUsage(oa.usage);
+        res.json(translateOpenAIResponseToAnthropic(oa, modelInfo, anBody.model));
+      }
+    } else {
+      if (chatBody.max_tokens && !chatBody.max_completion_tokens) {
+        chatBody.max_completion_tokens = chatBody.max_tokens;
+        delete chatBody.max_tokens;
+      }
+      if (isStream) chatBody.stream_options = { include_usage: true };
+      stripInternalMeta(chatBody); // breakpoint sidecar must never leak upstream
+      const upstreamRes = await tryProxy(modelInfo.path, chatBody, baseHeaders, modelInfo.tokenName);
+      if (upstreamRes.error) {
+        const errBody = safeParseJson(upstreamRes.body);
+        logUpstreamError(req, upstreamRes.status, errBody, modelInfo.family);
+        return res.status(upstreamRes.status).json(anthropicError(upstreamRes.status, errBody?.error?.message || errBody?.error || upstreamRes.statusText));
+      }
+      if (isStream) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        await pipeOpenAIStreamToAnthropic(upstreamRes.body, res, modelInfo, anBody.model);
+      } else {
+        const json = await upstreamRes.json();
+        trackUsage(json.usage);
+        if (budget.active) stripReasoning(json);
+        res.json(translateOpenAIResponseToAnthropic(json, modelInfo, anBody.model));
+      }
+    }
+    STATS.requests++;
+  } catch (e) {
+    requestFailed(req, e);
+    log("error", "Messages error:", e.message);
+    if (!res.headersSent) return res.status(502).json(anthropicError(502, e.message));
+    res.end();
+  }
+});
 
 const PORT = CONFIG.port;
 const httpServer = app.listen(PORT, () => {
